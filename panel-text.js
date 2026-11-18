@@ -85,6 +85,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// Never let Express, a tunnel or the game cache /out: most frames are the same few
+// values, and a cached or 304 reply would hand the game stale data.
+app.disable('etag');
+app.use((req, res, next) => {
+  if (req.path === '/out') res.set('Cache-Control', 'no-store');
+  next();
+});
+
 app.use(express.json());
 
 const PORT = 3000;
@@ -120,11 +128,11 @@ const PORT = 3000;
 //   'change'      1 poll per character (10 letters/second at 0.1 s). A lost poll can
 //                 lose a letter.
 //   'change-safe' each character held 2 polls (5 letters/second). Survives one lost poll.
-const CIRCUIT = 'pulse-fast';
+const CIRCUIT = 'pulse-safe';
 // CLEAR_WAIT is no longer used by clearFrames(); see CLEAR_HOLD / CLEAR_SETTLE below.
 const PRESETS = {
   'pulse-fast': { CHAR_FRAMES: 1, GAP: 'always', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
-  'pulse-safe': { CHAR_FRAMES: 2, GAP: 'always', GAP_FRAMES: 2, CLEAR_WAIT: 1 },
+  'pulse-safe': { CHAR_FRAMES: 3, GAP: 'always', GAP_FRAMES: 3, CLEAR_WAIT: 1 },
   change: { CHAR_FRAMES: 1, GAP: 'repeats', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
   'change-safe': { CHAR_FRAMES: 2, GAP: 'repeats', GAP_FRAMES: 2, CLEAR_WAIT: 1 },
   loop: { CHAR_FRAMES: 1, GAP: 'repeats', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
@@ -140,8 +148,8 @@ const CLEAR_BEFORE_TEXT = true;
 
 // Clear frame is held this many polls, then this many code-0 polls are sent
 // so the reset can finish before the first letter. Raise if you still get junk.
-const CLEAR_HOLD = 2;
-const CLEAR_SETTLE = 3;
+const CLEAR_HOLD = 1;
+const CLEAR_SETTLE = 1;
 
 // ---- Show the user's message on the panel before the reply ----
 const SHOW_INPUT = true;

@@ -21,7 +21,16 @@
 //   (second terminal) cloudflared tunnel --url http://localhost:3000   (or ngrok http 3000)
 //
 // Web page (your browser):  https://YOUR-TUNNEL-URL/
-// Transmitter Url (GET ON): https://YOUR-TUNNEL-URL/out
+// Transmitter Url:          https://YOUR-TUNNEL-URL/out
+//
+// HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
+//   {"value":"00000000"}
+// and the server answers with the next panel frame, also as {"value":"........"}.
+// The FIRST characters of what you POST are control pins (first pin = leftmost):
+//   pin 1 = INTERRUPT: stop the response that is being drawn (or still being thought up)
+//   pin 2 = REDO:      ask the AI again for the last message and draw the new answer
+// Both act once on the rising edge (0 -> 1), so holding a pin high does not repeat.
+// The other 6 pins are ignored. GET /out still works the old way (no controls).
 //
 // The page and its API ask for a password (HTTP Basic Auth; any username, the
 // password is what counts). The password is "hi10h"; override it by starting with
@@ -93,6 +102,10 @@ app.use((req, res, next) => {
   next();
 });
 
+// The game's transmitter may not label its POST body as JSON, so /out reads the body
+// as raw text whatever the Content-Type is, and parses it itself (see readInputBits).
+// This must come before express.json(), which then skips the already-read body.
+app.use('/out', express.text({ type: () => true }));
 app.use(express.json());
 
 const PORT = 3000;
@@ -202,6 +215,14 @@ const SPACE_CODE = 63;
 // Flip if the game reads the 8-bit string in the opposite direction
 const REVERSE_BITS = false;
 
+// ---- Control pins, read from the value the transmitter POSTs to /out ----
+// Position in the posted string, counting from 0 at the leftmost (first) pin.
+const PIN_INTERRUPT = 0;
+const PIN_REDO = 1;
+
+// true = an interrupt also clears the panel; false = the half-drawn text stays.
+const INTERRUPT_CLEARS_SCREEN = false;
+
 // Per-character overrides, as full 7-bit codes (0-127).
 // 'Î' is missing from your table, so it uses the same code as 'Ì'.
 const CUSTOM = { 'Î': 113 };
@@ -280,6 +301,9 @@ const SHORTEN_PROMPT =
 // [{ role: 'user' | 'assistant', content: '...' }, ...]
 let history = [];
 
+// The last message that got an answer; the REDO pin asks the AI about it again.
+let lastUserMessage = '';
+
 function pushHistory(role, content) {
   history.push({ role, content });
   const cap = MAX_HISTORY_TURNS * 2;
@@ -288,6 +312,7 @@ function pushHistory(role, content) {
 
 function clearHistory() {
   history = [];
+  lastUserMessage = ''; // nothing left to redo
 }
 
 // ======================= CHARACTER TABLE =======================
@@ -409,18 +434,96 @@ function noteSent(frame) {
   prevSent = frame;
 }
 
-// The game polls this. Each poll consumes one frame from the queue.
-app.get('/out', (req, res) => {
+// ---- Control pins (INTERRUPT / REDO) ----
+
+// Pull the 8-bit string out of the request. Accepts {"value":"00000000"} as a JSON
+// body (whatever the Content-Type), a bare 8-bit body, or ?value=... in the URL.
+// Returns null when there is nothing usable (a plain GET, or a malformed body).
+function readInputBits(req) {
+  let v;
+  const raw = req.body;
+  if (raw && typeof raw === 'object') {
+    v = raw.value;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const j = JSON.parse(raw);
+      v = j && typeof j === 'object' ? j.value : j;
+    } catch (e) {
+      const m = raw.match(/[01]{8}/);
+      v = m ? m[0] : undefined;
+    }
+  }
+  if (v === undefined || v === null) v = req.query.value;
+  if (v === undefined || v === null) return null;
+
+  let s = String(v).trim();
+  if (!/^[01]+$/.test(s)) return null;
+  s = s.padEnd(8, '0').slice(0, 8); // first character = first pin
+  return REVERSE_BITS ? s.split('').reverse().join('') : s;
+}
+
+let prevIn = null;      // the previous POSTed value; null until the first POST
+let lastIn = null;      // shown on the page
+let lastAction = '';    // shown on the page
+
+function noteAction(text) {
+  lastAction = new Date().toLocaleTimeString() + ' ' + text;
+}
+
+// INTERRUPT: stop whatever is being drawn and forget any answer still being written.
+function interruptResponse() {
+  chatGen++;          // a Groq call still in flight is discarded when it returns
+  chatBusy = false;   // so a new message can be sent straight away
+  queue = [];
+  if (INTERRUPT_CLEARS_SCREEN) queue.push(...clearFrames());
+  noteAction('INTERRUPT');
+}
+
+// REDO: ask the AI again about the last message and draw the new answer.
+function redoResponse() {
+  if (!groqKey) return noteAction('REDO ignored (no key)');
+  if (!lastUserMessage) return noteAction('REDO ignored (nothing to redo)');
+  if (chatBusy) return noteAction('REDO ignored (still working)');
+  queue = []; // stop drawing the old answer right away
+  noteAction('REDO');
+  runChat(lastUserMessage, true).catch((e) => {
+    noteAction('REDO failed: ' + e.message);
+    console.error('Redo failed:', e.message);
+  });
+}
+
+// A pin only fires on its rising edge (0 -> 1), so a transmitter that keeps
+// POSTing the same "1" does not trigger it again on every poll.
+function handleControlPins(bits) {
+  lastIn = bits;
+  if (prevIn !== null) {
+    const rose = (i) => bits[i] === '1' && prevIn[i] === '0';
+    if (rose(PIN_INTERRUPT)) interruptResponse();
+    if (rose(PIN_REDO)) redoResponse();
+  }
+  prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
+}
+
+// The game calls this. GET = plain poll. POST = the transmitter's pin state comes in
+// the body and is handled first. Either way, each call consumes one frame from the queue
+// and the answer is {"value":"........"}.
+function outHandler(req, res) {
   notePoll(req);
   if (OUT_TOKEN && req.query.token !== OUT_TOKEN) {
     return res.status(401).json({ error: 'bad or missing token' });
+  }
+  if (req.method === 'POST') {
+    const bits = readInputBits(req);
+    if (bits !== null) handleControlPins(bits);
   }
   if (held !== null) return res.json({ value: held });
   const frame = queue.length ? queue.shift() : blank(); // empty: always 00000000
   last = frame;
   noteSent(frame);
   res.json({ value: toValue(frame) });
-});
+}
+
+app.route('/out').get(outHandler).post(outHandler);
 
 // ======================= GROQ HELPERS =======================
 
@@ -504,10 +607,10 @@ async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
 // Ask for a short reply, and if it came back cut off or over-long, retry (up to
 // RETRY_LIMIT times) asking the model for a COMPLETE shorter answer. Never returns
 // a mid-word cut.
-async function askGroq(message) {
+async function askGroq(message, hist = history) {
   const base = [
     { role: 'system', content: currentSystemPrompt() }, // default or your custom prompt
-    ...history, // remembered turns
+    ...hist, // remembered turns (for a redo: without the answer being replaced)
     { role: 'user', content: message },
   ];
 
@@ -621,27 +724,30 @@ app.post('/api/prompt', (req, res) => {
 // for the next call.
 // chatBusy stops two requests (button + Enter, or two tabs) from running at once.
 let chatBusy = false;
+// Bumped by every new request and by INTERRUPT. A request whose number is no longer
+// current was interrupted (or superseded): its answer is thrown away.
+let chatGen = 0;
 
-app.post('/api/chat', async (req, res) => {
-  if (!requireKey(res)) return;
-  if (chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
-
-  const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
-  if (!message) return res.status(400).json({ error: 'Type a message first.' });
-
+// Ask the AI and put the exchange on the panel. Used by the web page (/api/chat) and
+// by the REDO pin. redo = true replaces the last exchange instead of adding a new one.
+// Resolves to { reply } or { interrupted: true }; throws if Groq fails.
+async function runChat(message, redo = false) {
+  const myGen = ++chatGen;
   chatBusy = true;
+  const base = redo ? history.slice(0, -2) : history; // redo: leave out the old answer
   let reply;
   try {
-    reply = await askGroq(message);
-  } catch (e) {
-    return res.status(502).json({ error: e.message });
+    reply = await askGroq(message, base);
   } finally {
-    chatBusy = false;
+    if (myGen === chatGen) chatBusy = false;
   }
+  if (myGen !== chatGen) return { interrupted: true };
 
   // Remember this exchange only after a successful reply.
+  if (redo) history = base.slice();
   pushHistory('user', message);
   pushHistory('assistant', reply);
+  lastUserMessage = message;
 
   queue = []; // the new message replaces whatever was still being drawn
   if (CLEAR_BEFORE_TEXT) queue.push(...clearFrames());
@@ -659,8 +765,37 @@ app.post('/api/chat', async (req, res) => {
   } else {
     queue.push(...buildFrames(Array.from(reply).slice(0, 200).map(encode)));
   }
+  return { reply };
+}
 
-  res.json({ reply, queued: queue.length, memory: history.length / 2 });
+app.post('/api/chat', async (req, res) => {
+  if (!requireKey(res)) return;
+  if (chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
+
+  const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
+  if (!message) return res.status(400).json({ error: 'Type a message first.' });
+
+  let result;
+  try {
+    result = await runChat(message);
+  } catch (e) {
+    return res.status(502).json({ error: e.message });
+  }
+  if (result.interrupted) return res.json({ reply: '(interrupted)', interrupted: true, queued: queue.length, memory: history.length / 2 });
+
+  res.json({ reply: result.reply, queued: queue.length, memory: history.length / 2 });
+});
+
+// Same as the INTERRUPT / REDO pins, for testing from the page.
+app.post('/api/interrupt', (_req, res) => {
+  interruptResponse();
+  res.json({ ok: true, queued: queue.length });
+});
+
+app.post('/api/redo', (_req, res) => {
+  if (!requireKey(res)) return;
+  redoResponse();
+  res.json({ ok: true, action: lastAction });
 });
 
 // Forget the conversation (the key is kept).
@@ -734,6 +869,8 @@ app.get('/api/status', (_req, res) => {
     code: last.code,
     clear: last.clear,
     value: held !== null ? held : toValue(last),
+    input: lastIn,
+    action: lastAction,
     glyph: held !== null ? 'HELD (test)' : last.clear ? 'CLEAR SCREEN' : glyph(last.code),
   });
 });
@@ -828,6 +965,13 @@ const PAGE = `<!doctype html>
     <small>Sends exactly these 8 bits, left to right, until released. The first bit should be your clear pin.</small>
   </section>
 
+  <section>
+    <h2>Control pins (test)</h2>
+    <button class="gray" onclick="post('/api/interrupt')">Interrupt</button>
+    <button class="gray needs-key" onclick="post('/api/redo')">Redo</button><br>
+    <small>Same as pin 1 and pin 2 of the value the game POSTs to /out.</small>
+  </section>
+
   <button class="gray" onclick="post('/api/cancel')">Cancel queue</button>
 </details>
 
@@ -838,6 +982,7 @@ const PAGE = `<!doctype html>
 <div class="st" id="st5"></div>
 <div class="st" id="st6"></div>
 <div class="st" id="st7"></div>
+<div class="st" id="st8"></div>
 
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
@@ -980,6 +1125,7 @@ const PAGE = `<!doctype html>
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
       document.getElementById('st6').textContent = 'callers of /out: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
+      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' (pin 1 = interrupt, pin 2 = redo) | last action: ' + (s.action || 'none');
     } catch (e) {}
   }
 

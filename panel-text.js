@@ -361,8 +361,42 @@ function buildFrames(codes) {
   return out;
 }
 
+// ---- Poll diagnostics: who is calling /out, how often, and are there gaps? ----
+// Every request to /out consumes a frame, so a second caller (another browser tab,
+// a tunnel health check, a second transmitter) or a stalled tunnel scrambles the
+// panel. These numbers are shown at the bottom of the page.
+const pollLog = []; // timestamps of the last 10 s of /out requests
+const pollClients = new Map();
+let pollTotal = 0;
+
+function notePoll(req) {
+  const now = Date.now();
+  pollTotal++;
+  pollLog.push(now);
+  while (pollLog.length && now - pollLog[0] > 10000) pollLog.shift();
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '?').split(',')[0].trim();
+  const who = ip + ' / ' + String(req.headers['user-agent'] || 'no-agent').slice(0, 40);
+  pollClients.set(who, (pollClients.get(who) || 0) + 1);
+  if (pollClients.size > 20) pollClients.delete(pollClients.keys().next().value);
+}
+
+function pollStats() {
+  const now = Date.now();
+  while (pollLog.length && now - pollLog[0] > 10000) pollLog.shift();
+  let maxGap = 0;
+  for (let i = 1; i < pollLog.length; i++) maxGap = Math.max(maxGap, pollLog[i] - pollLog[i - 1]);
+  return {
+    perSec: pollLog.filter((t) => now - t <= 1000).length,
+    maxGapMs: maxGap,
+    agoMs: pollLog.length ? now - pollLog[pollLog.length - 1] : null,
+    total: pollTotal,
+    clients: Array.from(pollClients.entries()).map(([k, v]) => v + 'x ' + k),
+  };
+}
+
 // The game polls this. Each poll consumes one frame from the queue.
 app.get('/out', (req, res) => {
+  notePoll(req);
   if (OUT_TOKEN && req.query.token !== OUT_TOKEN) {
     return res.status(401).json({ error: 'bad or missing token' });
   }
@@ -678,6 +712,7 @@ app.get('/api/status', (_req, res) => {
     prompt: customPrompt !== null ? 'custom' : 'default',
     memory: history.length / 2,
     memoryMax: MAX_HISTORY_TURNS,
+    polls: pollStats(),
     queued: queue.length,
     code: last.code,
     clear: last.clear,
@@ -783,6 +818,8 @@ const PAGE = `<!doctype html>
 <div class="st" id="st2"></div>
 <div class="st" id="st3"></div>
 <div class="st" id="st4"></div>
+<div class="st" id="st5"></div>
+<div class="st" id="st6"></div>
 
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
@@ -921,6 +958,9 @@ const PAGE = `<!doctype html>
       document.getElementById('st2').textContent = 'memory: ' + s.memory + ' / ' + s.memoryMax + ' turns';
       document.getElementById('st3').textContent = 'on the pins: code ' + s.code + ' = ' + s.glyph + ' (clear bit ' + s.clear + ')';
       document.getElementById('st4').textContent = 'value: ' + s.value;
+      var p = s.polls;
+      document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
+      document.getElementById('st6').textContent = 'callers of /out: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
     } catch (e) {}
   }
 

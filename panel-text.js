@@ -10,6 +10,10 @@
 // so follow-up messages can refer back to earlier ones. Memory lives in this process
 // only, like the key, so it is forgotten when the server restarts.
 //
+// NEW: you can set your own AI prompt (system prompt) on the web page, under
+// "3. AI prompt". It is also kept in memory only. To start with a custom prompt,
+// use PANEL_PROMPT="You are a pirate..." node panel-text.js
+//
 // Setup:
 //   npm install express
 //   node panel-text.js                          (Node 18+ is required: it uses fetch)
@@ -218,9 +222,19 @@ const MAX_INPUT_CHARS = 300;      // don't forward huge prompts
 // one assistant reply. Older turns are dropped once the limit is exceeded.
 const MAX_HISTORY_TURNS = 10;
 
-const SYSTEM_PROMPT =
+// ======================= PROMPT (CUSTOMIZABLE) =======================
+
+// The default prompt is made of two parts:
+//   DEFAULT_PERSONA - who the model is and how it behaves. This is the part you
+//                     normally want to replace with your own text.
+//   PANEL_RULES     - the technical limits of the panel (short, one line, only
+//                     characters the panel can draw). Appended after your prompt
+//                     unless you untick "Add the panel rules" on the page.
+const DEFAULT_PERSONA =
   'You write replies for a 16x16 LED matrix panel that can only show a single line. ' +
-  'You are continuing a conversation, so use earlier turns when they help. ' +
+  'You are continuing a conversation, so use earlier turns when they help. ';
+
+const PANEL_RULES =
   'Always finish your reply: write complete words and complete sentences, never stop mid-word or mid-sentence. ' +
   'Answer the latest user message in as few characters as possible: normally 1 to 5 words ' +
   '(under 25 characters). Only go a little longer (never more than 48 characters) when the ' +
@@ -228,6 +242,21 @@ const SYSTEM_PROMPT =
   'instead of cutting it off. ' +
   'Reply with plain text on one line: no emojis, no markdown, no quotes, no explanations. ' +
   'Use only letters, digits, spaces and the characters . , ! ? - = / : ; ( ) + _ \' and accented letters.';
+
+const MAX_PROMPT_CHARS = 2000;
+
+// The prompt that is in use right now. null = use DEFAULT_PERSONA.
+// Pre-fill it with PANEL_PROMPT="..." when starting the server.
+let customPrompt = String(process.env.PANEL_PROMPT || '').trim().slice(0, MAX_PROMPT_CHARS) || null;
+let appendRules = true;
+
+function currentSystemPrompt() {
+  const persona = customPrompt !== null ? customPrompt : DEFAULT_PERSONA;
+  // The default persona always gets the panel rules; a custom prompt gets them
+  // only when the box is ticked.
+  if (customPrompt === null || appendRules) return persona.trim() + ' ' + PANEL_RULES;
+  return persona.trim();
+}
 
 const SHORTEN_PROMPT =
   'That answer was cut off or too long. Reply again with the complete answer in under 48 characters. ' +
@@ -397,7 +426,7 @@ async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
 // a mid-word cut.
 async function askGroq(message) {
   const base = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: currentSystemPrompt() }, // default or your custom prompt
     ...history, // remembered turns
     { role: 'user', content: message },
   ];
@@ -474,6 +503,40 @@ app.post('/api/key', async (req, res) => {
 
   groqKey = key;
   res.json({ ok: true, key: true, message: 'Key set — the panel is unlocked.' });
+});
+
+// Read the prompt currently in use (the page loads this into the text box).
+app.get('/api/prompt', (_req, res) => {
+  res.json({
+    custom: customPrompt !== null,
+    prompt: customPrompt !== null ? customPrompt : DEFAULT_PERSONA.trim(),
+    defaultPrompt: DEFAULT_PERSONA.trim(),
+    appendRules,
+    rules: PANEL_RULES,
+    maxChars: MAX_PROMPT_CHARS,
+  });
+});
+
+// Set your own prompt. An empty prompt goes back to the default.
+// Changing the prompt also starts a fresh conversation, so old replies written
+// under the previous prompt don't confuse the model.
+app.post('/api/prompt', (req, res) => {
+  const prompt = String(req.body.prompt || '').trim();
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    return res.status(400).json({ error: 'Prompt too long (max ' + MAX_PROMPT_CHARS + ' characters).' });
+  }
+  if (req.body.appendRules !== undefined) appendRules = !!req.body.appendRules;
+
+  customPrompt = prompt ? prompt : null;
+  if (customPrompt === null) appendRules = true;
+  clearHistory();
+
+  res.json({
+    ok: true,
+    custom: customPrompt !== null,
+    appendRules,
+    message: customPrompt !== null ? 'Custom prompt saved. New conversation started.' : 'Back to the default prompt. New conversation started.',
+  });
 });
 
 // Type a message, get a short Groq reply that can see earlier turns, and show
@@ -577,6 +640,7 @@ app.get('/api/status', (_req, res) => {
   res.json({
     key: !!groqKey,
     model: GROQ_MODEL,
+    prompt: customPrompt !== null ? 'custom' : 'default',
     memory: history.length / 2,
     memoryMax: MAX_HISTORY_TURNS,
     queued: queue.length,
@@ -597,13 +661,16 @@ const PAGE = `<!doctype html>
   section { background:#1c1c1c; border-radius:12px; padding:1rem; margin-bottom:1rem; }
   h1 { font-size:1.4rem; }
   h2 { margin:0 0 .75rem; font-size:1.05rem; }
-  input, button { font-size:1rem; padding:.5rem .7rem; border-radius:8px; border:0; margin:.2rem; }
+  input, button, textarea { font-size:1rem; padding:.5rem .7rem; border-radius:8px; border:0; margin:.2rem; }
   input[type=text], input[type=password] { width:65%; }
   input[type=number] { width:4.5rem; }
+  input[type=checkbox] { width:auto; margin:.2rem .4rem .2rem 0; vertical-align:middle; }
+  textarea { width:calc(100% - .4rem); box-sizing:border-box; min-height:7rem; resize:vertical; font-family:inherit; background:#fff; color:#111; }
   button { background:#2d6cdf; color:#fff; cursor:pointer; }
   button.gray { background:#444; }
   button:disabled { background:#2a2a2a; color:#666; cursor:not-allowed; }
   label { margin-right:.6rem; white-space:nowrap; }
+  label.wrap { white-space:normal; display:block; margin:.3rem 0; }
   small { color:#999; display:inline-block; margin-top:.35rem; }
   .st { font-family:monospace; font-size:.9rem; color:#9aa; line-height:1.5; }
   .locked { border:1px solid #a33; }
@@ -628,8 +695,18 @@ const PAGE = `<!doctype html>
   <input id="msg" type="text" placeholder="Say something..." autocomplete="off">
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
-  <small>The panel shows your message first, then the reply under it. The model answers briefly (target under 48 characters) but always with complete words. It remembers the last few messages.</small>
+  <small>The panel shows your message first, then the reply under it. It remembers the last few messages.</small>
   <div class="st" id="reply"></div>
+</section>
+
+<section id="promptsec">
+  <h2>3. AI prompt</h2>
+  <textarea id="prompt" placeholder="Describe how the AI should behave..."></textarea>
+  <label class="wrap"><input id="rules" type="checkbox" checked>Add the panel rules (one short line, only characters the panel can draw)</label>
+  <button onclick="savePrompt()">Save prompt</button>
+  <button class="gray" onclick="resetPrompt()">Reset to default</button>
+  <small>Example: You are a grumpy pirate. Answer in pirate slang. Saving starts a new conversation. Leave the box empty and save to go back to the default. Kept in memory only (lost on restart).</small>
+  <div class="st" id="promptst"></div>
 </section>
 
 <details>
@@ -726,6 +803,52 @@ const PAGE = `<!doctype html>
     document.getElementById('reply').textContent = 'new conversation';
   }
 
+  // ---- AI prompt ----
+  // Loaded once on page load (not on the 0.5 s refresh) so it never overwrites
+  // what you are typing.
+  async function loadPrompt() {
+    try {
+      var r = await fetch('/api/prompt', { headers: H });
+      var p = await r.json();
+      document.getElementById('prompt').value = p.prompt;
+      document.getElementById('rules').checked = p.appendRules;
+      var box = document.getElementById('promptst');
+      box.textContent = p.custom ? 'Using your custom prompt.' : 'Using the default prompt.';
+      box.className = 'st';
+    } catch (e) {}
+  }
+
+  async function savePrompt() {
+    var box = document.getElementById('promptst');
+    box.textContent = 'saving...';
+    box.className = 'st';
+    try {
+      var r = await fetch('/api/prompt', {
+        method: 'POST',
+        headers: H,
+        body: JSON.stringify({
+          prompt: document.getElementById('prompt').value,
+          appendRules: document.getElementById('rules').checked
+        })
+      });
+      var j = await r.json();
+      if (!r.ok) { box.textContent = j.error || 'could not save'; box.className = 'st bad'; return; }
+      box.textContent = j.message;
+      box.className = 'st ok';
+      document.getElementById('reply').textContent = 'new conversation';
+      refresh();
+    } catch (e) {
+      box.textContent = 'error: ' + e.message;
+      box.className = 'st bad';
+    }
+  }
+
+  async function resetPrompt() {
+    document.getElementById('prompt').value = '';
+    await savePrompt();
+    loadPrompt();
+  }
+
   async function sendMsg() {
     var box = document.getElementById('msg');
     var out = document.getElementById('reply');
@@ -756,7 +879,7 @@ const PAGE = `<!doctype html>
       var r = await fetch('/api/status', { headers: H });
       var s = await r.json();
       applyKey(s.key);
-      document.getElementById('st1').textContent = 'model: ' + s.model + ' | queued frames: ' + s.queued;
+      document.getElementById('st1').textContent = 'model: ' + s.model + ' | prompt: ' + s.prompt + ' | queued frames: ' + s.queued;
       document.getElementById('st2').textContent = 'memory: ' + s.memory + ' / ' + s.memoryMax + ' turns';
       document.getElementById('st3').textContent = 'on the pins: code ' + s.code + ' = ' + s.glyph + ' (clear bit ' + s.clear + ')';
       document.getElementById('st4').textContent = 'value: ' + s.value;
@@ -767,6 +890,7 @@ const PAGE = `<!doctype html>
     if (e.key === 'Enter') sendMsg();
   });
 
+  loadPrompt();
   refresh();
   setInterval(refresh, 500);
 </script>`;
@@ -777,4 +901,5 @@ app.listen(PORT, () => {
   console.log('Panel page: http://localhost:' + PORT + '/ (password protected)');
   console.log('Game transmitter path: /out' + (OUT_TOKEN ? '?token=...' : ' (open)'));
   console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY.' : 'No Groq key yet - set one on the page.');
+  console.log(customPrompt !== null ? 'Custom prompt loaded from PANEL_PROMPT.' : 'Using the default prompt (change it on the page).');
 });

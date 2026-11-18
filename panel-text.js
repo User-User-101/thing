@@ -128,7 +128,7 @@ const PORT = 3000;
 //   'change'      1 poll per character (10 letters/second at 0.1 s). A lost poll can
 //                 lose a letter.
 //   'change-safe' each character held 2 polls (5 letters/second). Survives one lost poll.
-const CIRCUIT = 'pulse-safe';
+const CIRCUIT = 'pulse-fast';
 // CLEAR_WAIT is no longer used by clearFrames(); see CLEAR_HOLD / CLEAR_SETTLE below.
 const PRESETS = {
   'pulse-fast': { CHAR_FRAMES: 1, GAP: 'always', GAP_FRAMES: 1, CLEAR_WAIT: 1 },

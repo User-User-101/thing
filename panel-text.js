@@ -313,6 +313,7 @@ function pushHistory(role, content) {
 function clearHistory() {
   history = [];
   lastUserMessage = ''; // nothing left to redo
+  abandonChat();        // an answer still being written must not bring it back
 }
 
 // ======================= CHARACTER TABLE =======================
@@ -472,8 +473,7 @@ function noteAction(text) {
 
 // INTERRUPT: stop whatever is being drawn and forget any answer still being written.
 function interruptResponse() {
-  chatGen++;          // a Groq call still in flight is discarded when it returns
-  chatBusy = false;   // so a new message can be sent straight away
+  abandonChat();      // a Groq call still in flight is discarded when it returns
   queue = [];
   if (INTERRUPT_CLEARS_SCREEN) queue.push(...clearFrames());
   noteAction('INTERRUPT');
@@ -728,6 +728,13 @@ let chatBusy = false;
 // current was interrupted (or superseded): its answer is thrown away.
 let chatGen = 0;
 
+// Throw away any AI request that is still in flight (its answer is ignored when it
+// arrives) and free the "busy" lock so new messages and REDO work straight away.
+function abandonChat() {
+  chatGen++;
+  chatBusy = false;
+}
+
 // Ask the AI and put the exchange on the panel. Used by the web page (/api/chat) and
 // by the REDO pin. redo = true replaces the last exchange instead of adding a new one.
 // Resolves to { reply } or { interrupted: true }; throws if Groq fails.
@@ -815,6 +822,8 @@ app.post('/api/text', (req, res) => {
 
 app.post('/api/clear', (_req, res) => {
   if (!requireKey(res)) return;
+  lastUserMessage = ''; // REDO does nothing until a new message is sent
+  abandonChat();
   queue.push(...clearFrames());
   res.json({ queued: queue.length });
 });
@@ -851,6 +860,7 @@ app.post('/api/release', (_req, res) => {
 });
 
 app.post('/api/cancel', (_req, res) => {
+  abandonChat(); // also drops an answer that is still being written
   queue = [];
   held = null;
   res.json({ queued: 0 });

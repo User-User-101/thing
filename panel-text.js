@@ -394,6 +394,21 @@ function pollStats() {
   };
 }
 
+// ---- Sent log: the characters the server actually put on the pins, newest last ----
+// Compare this with what the panel drew. [CLR] = clear frame, · = blank cell.
+const sentLog = [];
+let prevSent = { clear: 0, code: 0 };
+
+function noteSent(frame) {
+  if (frame.clear && !prevSent.clear) {
+    sentLog.push('[CLR]');
+  } else if (!frame.clear && frame.code !== 0 && frame.code !== prevSent.code) {
+    sentLog.push(frame.code === SPACE_CODE ? '·' : (CHARS[frame.code] || '<' + frame.code + '>'));
+  }
+  while (sentLog.length > 80) sentLog.shift();
+  prevSent = frame;
+}
+
 // The game polls this. Each poll consumes one frame from the queue.
 app.get('/out', (req, res) => {
   notePoll(req);
@@ -403,6 +418,7 @@ app.get('/out', (req, res) => {
   if (held !== null) return res.json({ value: held });
   const frame = queue.length ? queue.shift() : blank(); // empty: always 00000000
   last = frame;
+  noteSent(frame);
   res.json({ value: toValue(frame) });
 });
 
@@ -713,6 +729,7 @@ app.get('/api/status', (_req, res) => {
     memory: history.length / 2,
     memoryMax: MAX_HISTORY_TURNS,
     polls: pollStats(),
+    sent: sentLog.join(''),
     queued: queue.length,
     code: last.code,
     clear: last.clear,
@@ -820,6 +837,7 @@ const PAGE = `<!doctype html>
 <div class="st" id="st4"></div>
 <div class="st" id="st5"></div>
 <div class="st" id="st6"></div>
+<div class="st" id="st7"></div>
 
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
@@ -961,6 +979,7 @@ const PAGE = `<!doctype html>
       var p = s.polls;
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
       document.getElementById('st6').textContent = 'callers of /out: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
+      document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
     } catch (e) {}
   }
 

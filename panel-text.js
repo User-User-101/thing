@@ -10,7 +10,7 @@
 // so follow-up messages can refer back to earlier ones. Memory lives in this process
 // only, like the key, so it is forgotten when the server restarts.
 //
-// NEW: you can set your own AI prompt (system prompt) on the web page, under
+// You can set your own AI prompt (system prompt) on the web page, under
 // "3. AI prompt". It is also kept in memory only. To start with a custom prompt,
 // use PANEL_PROMPT="You are a pirate..." node panel-text.js
 //
@@ -121,7 +121,7 @@ const PORT = 3000;
 //                 lose a letter.
 //   'change-safe' each character held 2 polls (5 letters/second). Survives one lost poll.
 const CIRCUIT = 'pulse-fast';
-// CLEAR_WAIT = code-0 polls sent after the clear frame, to give the reset time to finish.
+// CLEAR_WAIT is no longer used by clearFrames(); see CLEAR_HOLD / CLEAR_SETTLE below.
 const PRESETS = {
   'pulse-fast': { CHAR_FRAMES: 1, GAP: 'always', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
   'pulse-safe': { CHAR_FRAMES: 2, GAP: 'always', GAP_FRAMES: 2, CLEAR_WAIT: 1 },
@@ -133,10 +133,15 @@ const PRESETS = {
   // first letter to be written. Set CIRCUIT back to 'pulse-fast' afterwards.
   turbo: { CHAR_FRAMES: 1, GAP: 'never', GAP_FRAMES: 0, CLEAR_WAIT: 0 },
 };
-const { CHAR_FRAMES, GAP, GAP_FRAMES, CLEAR_WAIT } = PRESETS[CIRCUIT];
+const { CHAR_FRAMES, GAP, GAP_FRAMES } = PRESETS[CIRCUIT];
 
 // Every text send starts with a clear frame (first bit = 1, code bits 0000000)
 const CLEAR_BEFORE_TEXT = true;
+
+// Clear frame is held this many polls, then this many code-0 polls are sent
+// so the reset can finish before the first letter. Raise if you still get junk.
+const CLEAR_HOLD = 2;
+const CLEAR_SETTLE = 3;
 
 // ---- Show the user's message on the panel before the reply ----
 const SHOW_INPUT = true;
@@ -328,8 +333,10 @@ const toValue = (f) => bin8((f.clear << 7) | (f.code & 127));
 const blank = () => ({ clear: 0, code: 0 });
 const times = (f, count) => Array.from({ length: count }, () => ({ ...f }));
 
+// The clear frame is held CLEAR_HOLD polls, then CLEAR_SETTLE code-0 polls follow
+// so the reset has time to finish before the first letter arrives.
 function clearFrames() {
-  return [...times({ clear: 1, code: 0 }, CHAR_FRAMES), ...times(blank(), CLEAR_WAIT)];
+  return [...times({ clear: 1, code: 0 }, CLEAR_HOLD), ...times(blank(), CLEAR_SETTLE)];
 }
 
 // Each character is held for CHAR_FRAMES polls, with a code-0 gap (GAP_FRAMES polls)
@@ -366,12 +373,27 @@ function requireKey(res) {
   return false;
 }
 
-// Keep only characters the panel can actually draw, so the model can't fill the
-// screen with question marks.
-function sanitize(text) {
+// Only what the panel can safely draw (no # * | ~ ^ blocks or arrows)
+const REPLY_ALLOWED = new Set(Array.from(
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-=/:;()+_'\"àâçèéêîïûÀÂÇÈÉÊÌÎÏÛ"
+));
+
+const PUNCT_MAP = { '’': "'", '‘': "'", '“': '"', '”': '"', '–': '-', '—': '-', '…': '...' };
+
+function normalizeText(text) {
+  let out = '';
+  for (const ch of String(text)) out += PUNCT_MAP[ch] !== undefined ? PUNCT_MAP[ch] : ch;
+  return out.replace(/\uFE0F/g, '').replace(/\s/g, ' ');
+}
+
+function cleanReply(text) {
   const out = [];
-  for (const ch of text) {
-    if (ch === ' ' || CUSTOM[ch] !== undefined || LOOKUP.has(ch)) out.push(ch);
+  for (let ch of Array.from(normalizeText(text))) {
+    if (!REPLY_ALLOWED.has(ch)) {
+      ch = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); // ö -> o
+      if (ch.length !== 1 || !REPLY_ALLOWED.has(ch)) continue;
+    }
+    out.push(ch);
   }
   return out.join('').replace(/\s+/g, ' ').trim();
 }
@@ -379,7 +401,7 @@ function sanitize(text) {
 // Last-resort length cap, only used when the model still refuses to be short.
 // Cuts at a word boundary so a word is never split.
 function finalizeReply(text) {
-  let t = sanitize(text);
+  let t = cleanReply(text);
   if (t.length <= REPLY_HARD_CHARS) return t;
   let cut = t.slice(0, REPLY_HARD_CHARS);
   const space = cut.lastIndexOf(' ');
@@ -466,10 +488,7 @@ async function askGroq(message) {
 
   // Retries exhausted: return whatever we have, never split a word.
   const clean = finalizeReply(lastContent);
-  if (!clean) {
-    console.warn('Groq returned no usable text after retries.');
-    return '?';
-  }
+  if (!clean) throw new Error('Model returned no usable text. Try again.');
   return clean;
 }
 
@@ -542,28 +561,36 @@ app.post('/api/prompt', (req, res) => {
 // Type a message, get a short Groq reply that can see earlier turns, and show
 // the message followed by the reply on the panel. The exchange is remembered
 // for the next call.
+// chatBusy stops two requests (button + Enter, or two tabs) from running at once.
+let chatBusy = false;
+
 app.post('/api/chat', async (req, res) => {
   if (!requireKey(res)) return;
+  if (chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
 
-  const message = String(req.body.message || '').replace(/\uFE0F/g, '').replace(/[\r\n]/g, ' ').trim().slice(0, MAX_INPUT_CHARS);
+  const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
   if (!message) return res.status(400).json({ error: 'Type a message first.' });
 
+  chatBusy = true;
   let reply;
   try {
     reply = await askGroq(message);
   } catch (e) {
     return res.status(502).json({ error: e.message });
+  } finally {
+    chatBusy = false;
   }
 
   // Remember this exchange only after a successful reply.
   pushHistory('user', message);
   pushHistory('assistant', reply);
 
+  queue = []; // the new message replaces whatever was still being drawn
   if (CLEAR_BEFORE_TEXT) queue.push(...clearFrames());
 
   if (SHOW_INPUT) {
     // Echo only characters the panel can draw, so nothing turns into '?'
-    const body = Array.from(sanitize(message)).slice(0, ECHO_MAX_CHARS);
+    const body = Array.from(cleanReply(message)).slice(0, ECHO_MAX_CHARS);
     const echo = [...Array.from(ECHO_PREFIX), ...body, ...Array.from(ECHO_SUFFIX)];
     const codes = [
       ...echo.map(encode),
@@ -752,6 +779,7 @@ const PAGE = `<!doctype html>
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
   var keySet = false;
+  var sending = false;
 
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
@@ -853,7 +881,8 @@ const PAGE = `<!doctype html>
     var box = document.getElementById('msg');
     var out = document.getElementById('reply');
     var msg = box.value.trim();
-    if (!msg || !keySet) return;
+    if (!msg || !keySet || sending) return;
+    sending = true;
     var btn = document.getElementById('sendbtn');
     btn.disabled = true;
     out.textContent = 'thinking...';
@@ -865,6 +894,7 @@ const PAGE = `<!doctype html>
     } catch (e) {
       out.textContent = 'error: ' + e.message;
     }
+    sending = false;
     btn.disabled = !keySet;
     refresh();
   }

@@ -459,13 +459,15 @@ function redoResponse(t) {
 function handleControlPins(t, bits) {
   t.lastIn = bits;
   if (t.mode === 'os') {
-    osPins(t, bits); // handles its own baseline, so it also sees the very first POST
+    osPins(t, bits); // OS edge detection handles its own baseline
   } else if (t.prevIn !== null) {
     const rose = (i) => bits[i] === '1' && t.prevIn[i] === '0';
     if (rose(PIN_INTERRUPT)) interruptResponse(t);
     if (rose(PIN_REDO)) redoResponse(t);
   }
-  t.prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
+  // AI mode: the first POST only sets the baseline, so a pin that is already high at
+  // start does nothing. (OS mode already handled the first POST inside osPins.)
+  t.prevIn = bits;
 }
 
 // The game calls this. The pass header chooses the transmitter. GET = plain poll.
@@ -883,10 +885,11 @@ function osKey(t, key) {
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
 }
 
-// Input pins in OS mode. The first POST only sets the baseline.
+// Input pins in OS mode. A pin only fires on its rising edge, but the very first POST
+// after start / after a mode switch counts as a press for any pin that is already high,
+// so the physical buttons behave like the web page buttons (which fire on every click).
 function osPins(t, bits) {
-  const prev = t.prevIn;
-  if (prev === null) return;
+  const prev = t.prevIn || '00000000';
   OS_PINS.forEach((name, i) => {
     if (bits[i] === '1' && prev[i] === '0') osKey(t, name);
   });
@@ -1009,6 +1012,7 @@ app.post('/api/os/mode', (req, res) => {
   const mode = req.body.mode === 'os' ? 'os' : 'ai';
   abandonChat(t);
   t.mode = mode;
+  t.prevIn = null;   // fresh edge detection for the new mode
   t.queue = [];
   if (mode === 'os' && t.os.power) osDraw(t, osLine(t));
   else t.queue.push(...clearFrames());

@@ -12,7 +12,7 @@
 //        pin 1 = I/O (on / off; off = blank screen until pressed again)
 //        pin 2 = DOWN    pin 3 = UP    pin 4 = SELECT    pin 5 = FN1    pin 6 = FN2
 //   UP / DOWN change the selected app, SELECT opens it. Apps: ai chat, terminal, clock, dice.
-//   Every screen change clears the panel first. Details in the SIMULATED OS section below.
+//   Every handled key press clears the panel first. Details in the SIMULATED OS section below.
 //
 // The conversation (AI mode) is remembered server-side (the last MAX_HISTORY_TURNS
 // exchanges). Memory lives in this process only, like the key, so it is forgotten when
@@ -52,7 +52,7 @@
 // HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
 //   {"value":"00000000"}
 // (with the pass header) and the server answers with the next panel frame, also as
-//   {"value":"........"}.
+//   {"value":"........"}. 
 // The FIRST characters of what you POST are the input pins (first pin = leftmost).
 //   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
 //   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
@@ -698,6 +698,7 @@ async function runOsChat(t, message) {
   const display = padToRow(cleanReply(reply)) + '(click select to exit)';
   osAiDraw(t, display);
   t.os.ai.shown = true;
+  t.os.ai.text = display;   // remember the full multi-row text so a key press can redraw it
   return { reply };
 }
 
@@ -705,8 +706,8 @@ async function runOsChat(t, message) {
 //
 // A very small pretend OS (nothing real runs). The screen is ONE line of text, at most
 // CHARS_PER_ROW characters, except the AI app which uses the whole panel.
-// Every time the screen changes the panel is cleared first, then the new line is written,
-// so you never see leftovers from the previous screen.
+// Every handled key press clears the panel first, then the current line is written
+// (even if the text did not change), so no leftovers can survive a button press.
 //
 // KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires once, when its
 // pin goes from 0 to 1, with a short debounce so button bounce cannot double-fire.
@@ -759,7 +760,7 @@ function makeOS() {
     debounce: {},      // per-key timestamps for edge-debounce
     term: { buf: '', pending: '', out: null },
     dice: { side: 1, result: null },
-    ai: { shown: false },  // true once an AI answer has been drawn
+    ai: { shown: false, text: '' },  // text = full multi-row AI answer
   };
 }
 
@@ -793,7 +794,7 @@ function osLine(t) {
     case 'dice':
       return 'd' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result);
     case 'ai':
-      return os.ai.shown ? os.screen : 'ask me';
+      return os.ai.shown ? (os.ai.text || os.screen) : 'ask me';
     default:
       return 'err';
   }
@@ -829,7 +830,7 @@ function osPower(t, on) {
   os.lastKey = '';
   os.term = { buf: '', pending: '', out: null };
   os.dice = { side: 1, result: null };
-  os.ai = { shown: false };
+  os.ai = { shown: false, text: '' };
   if (on) {
     os.bootedAt = Date.now();
     osDraw(t, osLine(t));
@@ -917,7 +918,7 @@ function menuKey(t, key) {
     if (os.app === 'term') os.term = { buf: '', pending: '', out: null };
     if (os.app === 'dice') os.dice.result = rollDie(os);
     if (os.app === 'ai') {
-      os.ai = { shown: false };
+      os.ai = { shown: false, text: '' };
       clearHistory(t); // fresh conversation each time you enter the AI app
     }
   }
@@ -950,15 +951,18 @@ function osKey(t, key) {
   if (key === 'power') { osPower(t, !t.os.power); return; }
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return; }
 
-  const before = t.os.app;
   t.os.lastKey = key;
-  if (before === 'menu') menuKey(t, key);
-  else if (before === 'term') termKey(t, key);
+  if (t.os.app === 'menu') menuKey(t, key);
+  else if (t.os.app === 'term') termKey(t, key);
   else appKey(t, key);
 
   if (!t.os.power) return;   // the "off" command
-  const line = osLine(t);
-  if (t.os.app !== before || line !== t.os.screen) osDraw(t, line);   // new screen: clear + write
+
+  // Every handled key press clears the panel and writes the current screen again,
+  // even when the text did not change, so a button press always wipes whatever was
+  // left on the panel (and you can see the press was received).
+  if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
+  else osDraw(t, osLine(t));
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
 }
 

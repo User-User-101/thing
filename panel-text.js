@@ -1264,11 +1264,13 @@ function readPressed(req) {
 function inputPanel(req, res) {
   const password = givenPassword(req);
   if (!password) {
-    res.status(403).json({ error: 'Send the same pass header as the display transmitter.' });
+    // Keep the HTTP Transmitter response contract valid even on an auth error.
+    // Build Logic expects a string in response.value and reverses that string.
+    res.status(403).json({ value: '00000000', error: 'Send the same pass header as the display transmitter.' });
     return null;
   }
   if (password.length > MAX_PASSWORD_CHARS) {
-    res.status(400).json({ error: 'Password too long (max ' + MAX_PASSWORD_CHARS + ' characters).' });
+    res.status(400).json({ value: '00000000', error: 'Password too long (max ' + MAX_PASSWORD_CHARS + ' characters).' });
     return null;
   }
   return getTransmitter(password);
@@ -1276,8 +1278,8 @@ function inputPanel(req, res) {
 
 // KEYBOARD INPUT ROUTES
 // Accept POST (recommended) and GET (compatibility) so a transmitter configured
-// with either method does not fail with "Cannot GET/POST". These routes NEVER
-// return panel display frames; only /out supplies the display stream.
+// with either method does not fail with "Cannot GET/POST". They return the
+// required idle placeholder value=00000000; only /out supplies real display frames.
 function handleKeyboardEndpoint(req, res, routeName) {
   const t = inputPanel(req, res);
   if (!t) return;
@@ -1303,13 +1305,9 @@ function handleKeyboardEndpoint(req, res, routeName) {
     // Invalid/missing input is reported in JSON and Render logs instead of a bare HTTP 400.
     if (bits === null) {
       noteAction(t, 'keyboard bank ' + bank.id + ' received unrecognized input format');
-      return res.status(200).json({
-        ok: false,
-        endpoint: '/keys/' + bank.id,
-        error: 'Could not read the POST body as pin states.',
-        expected: '{\"value\":\"10000000\"} or bare 10000000 or [1,0,0,0,0,0,0,0]',
-        received: t.lastKeyboardRequest,
-      });
+      // The keyboard device only sends input. Return a valid idle output frame
+      // because Build Logic's HTTP Transmitter still expects response.value.
+      return res.status(200).json({ value: '00000000' });
     }
 
     const prev = t.keyBankPrev.get(bank.id) || '00000000';
@@ -1324,7 +1322,9 @@ function handleKeyboardEndpoint(req, res, routeName) {
     } else if (rising.length === 1) {
       dispatchKeyboardKey(t, rising[0]);
     }
-    return res.status(200).json({ ok: true, accepted: true, endpoint: '/keys/' + bank.id, bits, pressed: rising });
+    // Required response shape for Build Logic: value must always be a string.
+    // This is only an idle placeholder; real display frames are returned by /out.
+    return res.status(200).json({ value: '00000000' });
   }
 
   // Also support /keys/a, /keys/b, ... /keys/z, /keys/enter as aliases.
@@ -1332,16 +1332,19 @@ function handleKeyboardEndpoint(req, res, routeName) {
     const pressed = readPressed(req);
     if (pressed === null) {
       return res.status(400).json({
+        value: '00000000',
         error: 'For a single-key endpoint send {"pressed":true} on press and {"pressed":false} on release.'
       });
     }
     const prev = t.directKeyPrev.get(name) || false;
     t.directKeyPrev.set(name, pressed);
     if (pressed && !prev) dispatchKeyboardKey(t, name);
-    return res.status(204).end();
+    // Do not return 204: the game transmitter expects JSON containing a string value.
+    return res.status(200).json({ value: '00000000' });
   }
 
   return res.status(404).json({
+    value: '00000000',
     error: 'Unknown keyboard endpoint. Use /keys/1 through /keys/4, or /key/a through /key/z and /key/enter.'
   });
 }

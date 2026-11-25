@@ -11,8 +11,8 @@
 // only, like the key, so it is forgotten when the server restarts.
 //
 // You can set your own AI prompt (system prompt) on the web page, under
-// "4. AI prompt". It is also kept in memory only. To start with a custom prompt,
-// use PANEL_PROMPT="You are a pirate..." node panel-text.js
+// "4. AI prompt". It is kept per transmitter, in memory only. To start every new
+// transmitter with a custom prompt, use PANEL_PROMPT="You are a pirate..." node panel-text.js
 //
 // Setup:
 //   npm install express
@@ -23,28 +23,39 @@
 // Web page (your browser):  https://YOUR-TUNNEL-URL/
 // Transmitter Url:          https://YOUR-TUNNEL-URL/out
 //
-// ACCESS: the page itself is open. Under "1. Transmitter access" you choose the
-// shared password and the header name, and the page shows the headers DICTIONARY
-// to paste into the in-game HTTP Transmitter, e.g.
-//   {"x-panel-password":"hi10h"}
-// Every /api call from the page sends that same header, and the transmitter must
-// send it too when it polls /out. The password and header name are kept in the
-// server's memory (change them any time from the page). Start the server with
-// PANEL_PASSWORD=... / PASSWORD_HEADER=... to seed them instead.
-// /out also accepts ?token=secret when the server is started with OUT_TOKEN=secret,
-// for transmitters that cannot send headers.
+// ACCESS: there is no server-wide password any more. Instead, every request carries
+// a "pass" header, and the value of that header identifies ONE transmitter (panel).
+// In Build Logic, add this HTTP header to your HTTP Transmitter:
+//
+//     pass: my-secret-password
+//
+// The headers field on the transmitter takes a dictionary, so paste:
+//
+//     {"pass":"my-secret-password"}
+//
+// On the web page, type the SAME password under "1. Connect to a transmitter".
+// That is the only password you need. The page itself is open; the password is what
+// pairs it with your in-game transmitter. Any password works: type a new one and the
+// server creates a new transmitter (a new empty panel); type an existing one and you
+// are back on that panel, with its queue, history and prompt intact.
+//
+// MULTIPLE TRANSMITTERS: every different password is a separate panel. Each has its
+// own frame queue, conversation, prompt, and diagnostics. So you can drive several
+// in-game panels from the same server by giving each transmitter a different "pass"
+// value, and controlling one at a time from the page (or one tab per panel).
 //
 // HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
 //   {"value":"00000000"}
-// and the server answers with the next panel frame, also as {"value":"........"}.
+// (with the pass header) and the server answers with the next panel frame, also as
+//   {"value":"........"}.
 // The FIRST characters of what you POST are control pins (first pin = leftmost):
 //   pin 1 = INTERRUPT: stop the response that is being drawn (or still being thought up)
 //   pin 2 = REDO:      ask the AI again for the last message and draw the new answer
 // Both act once on the rising edge (0 -> 1), so holding a pin high does not repeat.
-// The other 6 pins are ignored. GET /out still works the old way (no controls).
+// The other 6 pins are ignored. GET /out also works, with the pass header (no controls).
 //
-// The Groq API key is REQUIRED. Nothing is sent to the panel until a key is set
-// and verified against api.groq.com.
+// The Groq API key is REQUIRED and is shared by all transmitters on this server.
+// Nothing is sent to a panel until a key is set and verified against api.groq.com.
 //
 // Output is an 8-bit string, leftmost bit first:
 //   X S C5 C4 C3 C2 C1 C0
@@ -54,65 +65,18 @@
 // Example: 'A' = 01000001, 'a' = 00000001, clear screen = 10000000, idle = 00000000.
 
 const express = require('express');
-const crypto = require('crypto');
 
 const app = express();
 
 // ======================= ACCESS CONTROL =======================
 
-// The shared secret and the header that carries it. Both can be changed at runtime
-// from the page ("1. Transmitter access"). The in-game HTTP Transmitter must send
-// the same header name/value; the page shows the exact dictionary to paste there.
-const DEFAULT_PASSWORD = String(process.env.PANEL_PASSWORD || 'hi10h').trim();
-let PANEL_PASS = DEFAULT_PASSWORD;
+// The header every request must carry. The value is the password that identifies
+// one transmitter. HTTP header names are case-insensitive, so the game sending
+// "Pass: my-secret-password" arrives here as "pass".
+const PASS_HEADER = 'pass';
 
-// HTTP header names are case-insensitive, so "X-Panel-Password" from the game
-// arrives here as "x-panel-password".
-function cleanHeaderName(name) {
-  return String(name || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '');
-}
-
-let PASSWORD_HEADER = cleanHeaderName(process.env.PASSWORD_HEADER || 'x-panel-password') || 'x-panel-password';
-
-// Optional: /out also accepts ?token=... , for transmitters that cannot send headers.
-const OUT_TOKEN = String(process.env.OUT_TOKEN || '').trim();
-
-if (!DEFAULT_PASSWORD) {
-  console.error('Refusing to start without a password.');
-  console.error('Start it like this instead:');
-  console.error('  PANEL_PASSWORD=something-secret node panel-text.js');
-  process.exit(1);
-}
-
-function safeEqual(a, b) {
-  const ab = Buffer.from(String(a), 'utf8');
-  const bb = Buffer.from(String(b), 'utf8');
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
-}
-
-// True when the request carries the right password in the configured header.
-function hasPassword(req) {
-  const v = req.headers[PASSWORD_HEADER];
-  const given = Array.isArray(v) ? String(v[0] || '') : (v === undefined || v === null ? '' : String(v));
-  if (!given) return false;
-  return safeEqual(given, PANEL_PASS);
-}
-
-// What the page and the game need to agree on: the header name, the password,
-// and the headers dictionary the transmitter expects.
-function accessInfo() {
-  const dictionary = JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS });
-  return {
-    header: PASSWORD_HEADER,
-    password: PANEL_PASS,
-    dictionary,
-    outToken: !!OUT_TOKEN,
-  };
-}
+// A password is used as a Map key and sent as a header, so keep it sane.
+const MAX_PASSWORD_CHARS = 200;
 
 // Never let Express, a tunnel or the game cache /out: most frames are the same few
 // values, and a cached or 304 reply would hand the game stale data.
@@ -128,15 +92,12 @@ app.use((req, res, next) => {
 app.use('/out', express.text({ type: () => true }));
 app.use(express.json());
 
-// Everything under /api needs the password header. The page itself (/) is public,
-// but it cannot do anything until you enter the password on it.
-app.use('/api', (req, res, next) => {
-  if (hasPassword(req)) return next();
-  return res.status(403).json({
-    error: 'Password required (send the ' + PASSWORD_HEADER + ' header).',
-    locked: true,
-  });
-});
+// Read the password header from a request. Empty string means "none given".
+function givenPassword(req) {
+  const v = req.headers[PASS_HEADER];
+  const raw = Array.isArray(v) ? String(v[0] || '') : (v === undefined || v === null ? '' : String(v));
+  return raw.trim();
+}
 
 const PORT = 3000;
 
@@ -261,6 +222,7 @@ const CUSTOM = { 'Î': 113 };
 
 // Get a key at https://console.groq.com/keys . It starts with "gsk_".
 // You can also start the server with GROQ_API_KEY=... to pre-fill it.
+// The key is shared by every transmitter on this server.
 let groqKey = String(process.env.GROQ_API_KEY || '').trim();
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -309,42 +271,102 @@ const PANEL_RULES =
 
 const MAX_PROMPT_CHARS = 2000;
 
-// The prompt that is in use right now. null = use DEFAULT_PERSONA.
+// Every new transmitter starts with this prompt (null = the built-in default persona).
 // Pre-fill it with PANEL_PROMPT="..." when starting the server.
-let customPrompt = String(process.env.PANEL_PROMPT || '').trim().slice(0, MAX_PROMPT_CHARS) || null;
-let appendRules = true;
-
-function currentSystemPrompt() {
-  const persona = customPrompt !== null ? customPrompt : DEFAULT_PERSONA;
-  // The default persona always gets the panel rules; a custom prompt gets them
-  // only when the box is ticked.
-  if (customPrompt === null || appendRules) return persona.trim() + ' ' + PANEL_RULES;
-  return persona.trim();
-}
+const INITIAL_PROMPT = String(process.env.PANEL_PROMPT || '').trim().slice(0, MAX_PROMPT_CHARS) || null;
 
 const SHORTEN_PROMPT =
   'That answer was cut off or too long. Reply again with the complete answer in under 48 characters. ' +
   'Keep complete words and complete sentences; shorten the wording instead of cutting anything off.';
 
-// ======================= CONVERSATION MEMORY =======================
+// ======================= TRANSMITTERS =======================
+//
+// One transmitter per distinct "pass" header value. Everything that used to be
+// per-server (queue, history, prompt, counters) now lives in an object in this
+// Map. Functions that used to read globals take the transmitter as their first
+// parameter.
 
-// [{ role: 'user' | 'assistant', content: '...' }, ...]
-let history = [];
+const transmitters = new Map(); // password -> transmitter
+const TRANSMITTER_IDLE_MS = 12 * 60 * 60 * 1000; // drop transmitters untouched for 12 h
 
-// The last message that got an answer; the REDO pin asks the AI about it again.
-let lastUserMessage = '';
+function makeTransmitter(password) {
+  return {
+    password,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+    lastPollAt: 0,
 
-function pushHistory(role, content) {
-  history.push({ role, content });
-  const cap = MAX_HISTORY_TURNS * 2;
-  if (history.length > cap) history = history.slice(-cap);
+    // ---- output ----
+    queue: [],
+    last: { clear: 0, code: 0 },     // the last frame sent (shown on the page)
+    held: null,                      // held 8-bit string for wiring tests
+    sentLog: [],                     // characters put on the pins, newest last
+    prevSent: { clear: 0, code: 0 },
+
+    // ---- input (control pins) ----
+    prevIn: null,
+    lastIn: null,
+    lastAction: '',
+
+    // ---- conversation ----
+    history: [],
+    lastUserMessage: '',
+
+    // ---- AI ----
+    chatBusy: false,
+    chatGen: 0,
+    customPrompt: INITIAL_PROMPT,
+    appendRules: true,
+
+    // ---- diagnostics ----
+    pollLog: [],                     // timestamps of the last 10 s of /out requests
+    pollClients: new Map(),          // ip / agent -> count
+    pollTotal: 0,
+    outRejected: 0,
+    outLastOk: null,
+  };
 }
 
-function clearHistory() {
-  history = [];
-  lastUserMessage = ''; // nothing left to redo
-  abandonChat();        // an answer still being written must not bring it back
+// Return the transmitter for a password, creating an empty one if it is new.
+function getTransmitter(password) {
+  let t = transmitters.get(password);
+  if (!t) {
+    t = makeTransmitter(password);
+    transmitters.set(password, t);
+  }
+  t.lastUsedAt = Date.now();
+  return t;
 }
+
+// Forget transmitters that no one has touched or polled for a long time, so a
+// typo or a stranger poking at the tunnel does not keep an object forever.
+function pruneTransmitters() {
+  const now = Date.now();
+  for (const [pass, t] of transmitters) {
+    const last = Math.max(t.lastUsedAt || 0, t.lastPollAt || 0);
+    if (now - last > TRANSMITTER_IDLE_MS) transmitters.delete(pass);
+  }
+}
+const pruneTimer = setInterval(pruneTransmitters, 60 * 60 * 1000);
+if (pruneTimer.unref) pruneTimer.unref();
+
+// Every /api call must carry the pass header. The value selects (or creates) the
+// transmitter, which the handler then works on. The page sends the same header
+// it just showed you in the dictionary.
+app.use('/api', (req, res, next) => {
+  const password = givenPassword(req);
+  if (!password) {
+    return res.status(403).json({
+      error: 'Send a "' + PASS_HEADER + ': your-password" header.',
+      needPassword: true,
+    });
+  }
+  if (password.length > MAX_PASSWORD_CHARS) {
+    return res.status(400).json({ error: 'Password too long (max ' + MAX_PASSWORD_CHARS + ' characters).' });
+  }
+  req.transmitter = getTransmitter(password);
+  next();
+});
 
 // ======================= CHARACTER TABLE =======================
 // Index = the 7-bit code (shift is the top bit). '' = blank or unassigned.
@@ -382,11 +404,7 @@ function glyph(code) {
   return CHARS[code] || '(blank)';
 }
 
-// ======================= OUTPUT =======================
-
-let queue = [];
-let last = { clear: 0, code: 0 }; // the last frame sent (shown in the page status)
-let held = null; // when set to an 8-bit string, /out sends exactly this until released (for wiring tests)
+// ======================= OUTPUT HELPERS =======================
 
 function bin8(n) {
   const s = (n & 255).toString(2).padStart(8, '0');
@@ -404,10 +422,11 @@ function clearFrames() {
 }
 
 // Each character is held for CHAR_FRAMES polls, with a code-0 gap (GAP_FRAMES polls)
-// where the preset asks for one (see CIRCUIT)
-function buildFrames(codes) {
+// where the preset asks for one (see CIRCUIT). Reads t.queue / t.last so a gap is
+// inserted correctly when frames are appended to an already non-empty queue.
+function buildFrames(t, codes) {
   const out = [];
-  let prev = queue.length ? queue[queue.length - 1].code : last.code;
+  let prev = t.queue.length ? t.queue[t.queue.length - 1].code : t.last.code;
   for (const code of codes) {
     const needGap = prev !== 0 && (GAP === 'always' || (GAP === 'repeats' && prev === code));
     if (needGap) out.push(...times(blank(), GAP_FRAMES));
@@ -417,52 +436,43 @@ function buildFrames(codes) {
   return out;
 }
 
-// ---- Poll diagnostics: who is calling /out, how often, and are there gaps? ----
-// Every request to /out consumes a frame, so a second caller (another browser tab,
-// a tunnel health check, a second transmitter) or a stalled tunnel scrambles the
-// panel. These numbers are shown at the bottom of the page.
-const pollLog = []; // timestamps of the last 10 s of /out requests
-const pollClients = new Map();
-let pollTotal = 0;
+// ---- Poll diagnostics ----
 
-function notePoll(req) {
+function notePoll(t, req) {
   const now = Date.now();
-  pollTotal++;
-  pollLog.push(now);
-  while (pollLog.length && now - pollLog[0] > 10000) pollLog.shift();
+  t.pollTotal++;
+  t.pollLog.push(now);
+  while (t.pollLog.length && now - t.pollLog[0] > 10000) t.pollLog.shift();
   const ip = String(req.headers['x-forwarded-for'] || req.ip || '?').split(',')[0].trim();
   const who = ip + ' / ' + String(req.headers['user-agent'] || 'no-agent').slice(0, 40);
-  pollClients.set(who, (pollClients.get(who) || 0) + 1);
-  if (pollClients.size > 20) pollClients.delete(pollClients.keys().next().value);
+  t.pollClients.set(who, (t.pollClients.get(who) || 0) + 1);
+  if (t.pollClients.size > 20) t.pollClients.delete(t.pollClients.keys().next().value);
 }
 
-function pollStats() {
+function pollStats(t) {
   const now = Date.now();
-  while (pollLog.length && now - pollLog[0] > 10000) pollLog.shift();
+  while (t.pollLog.length && now - t.pollLog[0] > 10000) t.pollLog.shift();
   let maxGap = 0;
-  for (let i = 1; i < pollLog.length; i++) maxGap = Math.max(maxGap, pollLog[i] - pollLog[i - 1]);
+  for (let i = 1; i < t.pollLog.length; i++) maxGap = Math.max(maxGap, t.pollLog[i] - t.pollLog[i - 1]);
   return {
-    perSec: pollLog.filter((t) => now - t <= 1000).length,
+    perSec: t.pollLog.filter((ts) => now - ts <= 1000).length,
     maxGapMs: maxGap,
-    agoMs: pollLog.length ? now - pollLog[pollLog.length - 1] : null,
-    total: pollTotal,
-    clients: Array.from(pollClients.entries()).map(([k, v]) => v + 'x ' + k),
+    agoMs: t.pollLog.length ? now - t.pollLog[t.pollLog.length - 1] : null,
+    total: t.pollTotal,
+    clients: Array.from(t.pollClients.entries()).map(([k, v]) => v + 'x ' + k),
   };
 }
 
 // ---- Sent log: the characters the server actually put on the pins, newest last ----
 // Compare this with what the panel drew. [CLR] = clear frame, · = blank cell.
-const sentLog = [];
-let prevSent = { clear: 0, code: 0 };
-
-function noteSent(frame) {
-  if (frame.clear && !prevSent.clear) {
-    sentLog.push('[CLR]');
-  } else if (!frame.clear && frame.code !== 0 && frame.code !== prevSent.code) {
-    sentLog.push(frame.code === SPACE_CODE ? '·' : (CHARS[frame.code] || '<' + frame.code + '>'));
+function noteSent(t, frame) {
+  if (frame.clear && !t.prevSent.clear) {
+    t.sentLog.push('[CLR]');
+  } else if (!frame.clear && frame.code !== 0 && frame.code !== t.prevSent.code) {
+    t.sentLog.push(frame.code === SPACE_CODE ? '·' : (CHARS[frame.code] || '<' + frame.code + '>'));
   }
-  while (sentLog.length > 80) sentLog.shift();
-  prevSent = frame;
+  while (t.sentLog.length > 80) t.sentLog.shift();
+  t.prevSent = frame;
 }
 
 // ---- Control pins (INTERRUPT / REDO) ----
@@ -493,78 +503,68 @@ function readInputBits(req) {
   return REVERSE_BITS ? s.split('').reverse().join('') : s;
 }
 
-let prevIn = null;      // the previous POSTed value; null until the first POST
-let lastIn = null;      // shown on the page
-let lastAction = '';    // shown on the page
-
-function noteAction(text) {
-  lastAction = new Date().toLocaleTimeString() + ' ' + text;
+function noteAction(t, text) {
+  t.lastAction = new Date().toLocaleTimeString() + ' ' + text;
 }
 
 // INTERRUPT: stop whatever is being drawn and forget any answer still being written.
-function interruptResponse() {
-  abandonChat();      // a Groq call still in flight is discarded when it returns
-  queue = [];
-  if (INTERRUPT_CLEARS_SCREEN) queue.push(...clearFrames());
-  noteAction('INTERRUPT');
+function interruptResponse(t) {
+  abandonChat(t);      // a Groq call still in flight is discarded when it returns
+  t.queue = [];
+  if (INTERRUPT_CLEARS_SCREEN) t.queue.push(...clearFrames());
+  noteAction(t, 'INTERRUPT');
 }
 
 // REDO: ask the AI again about the last message and draw the new answer.
-function redoResponse() {
-  if (!groqKey) return noteAction('REDO ignored (no key)');
-  if (!lastUserMessage) return noteAction('REDO ignored (nothing to redo)');
-  if (chatBusy) return noteAction('REDO ignored (still working)');
-  queue = []; // stop drawing the old answer right away
-  noteAction('REDO');
-  runChat(lastUserMessage, true).catch((e) => {
-    noteAction('REDO failed: ' + e.message);
+function redoResponse(t) {
+  if (!groqKey) return noteAction(t, 'REDO ignored (no key)');
+  if (!t.lastUserMessage) return noteAction(t, 'REDO ignored (nothing to redo)');
+  if (t.chatBusy) return noteAction(t, 'REDO ignored (still working)');
+  t.queue = []; // stop drawing the old answer right away
+  noteAction(t, 'REDO');
+  runChat(t, t.lastUserMessage, true).catch((e) => {
+    noteAction(t, 'REDO failed: ' + e.message);
     console.error('Redo failed:', e.message);
   });
 }
 
 // A pin only fires on its rising edge (0 -> 1), so a transmitter that keeps
 // POSTing the same "1" does not trigger it again on every poll.
-function handleControlPins(bits) {
-  lastIn = bits;
-  if (prevIn !== null) {
-    const rose = (i) => bits[i] === '1' && prevIn[i] === '0';
-    if (rose(PIN_INTERRUPT)) interruptResponse();
-    if (rose(PIN_REDO)) redoResponse();
+function handleControlPins(t, bits) {
+  t.lastIn = bits;
+  if (t.prevIn !== null) {
+    const rose = (i) => bits[i] === '1' && t.prevIn[i] === '0';
+    if (rose(PIN_INTERRUPT)) interruptResponse(t);
+    if (rose(PIN_REDO)) redoResponse(t);
   }
-  prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
+  t.prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
 }
 
-// ---- /out access: the transmitter must send the password header (or ?token=) ----
-let outRejected = 0;   // polls turned away for a bad/missing password
-let outLastOk = null;  // when a transmitter last got through
-
-function outAuthorized(req) {
-  if (hasPassword(req)) return true;
-  if (OUT_TOKEN && safeEqual(String(req.query.token || ''), OUT_TOKEN)) return true;
-  return false;
-}
-
-// The game calls this. GET = plain poll. POST = the transmitter's pin state comes in
-// the body and is handled first. Either way, each call consumes one frame from the queue
-// and the answer is {"value":"........"}.
+// The game calls this. The pass header chooses the transmitter. GET = plain poll.
+// POST = the transmitter's pin state comes in the body and is handled first.
+// Either way, each call consumes one frame from that transmitter's queue and the
+// answer is {"value":"........"}.
 function outHandler(req, res) {
-  if (!outAuthorized(req)) {
-    outRejected++;
-    return res.status(403).json({
-      error: 'bad or missing password header (' + PASSWORD_HEADER + ')',
-    });
+  const password = givenPassword(req);
+  if (!password) {
+    return res.status(403).json({ error: 'Send a "' + PASS_HEADER + ': your-password" header.' });
   }
-  outLastOk = Date.now();
-  notePoll(req);
+  if (password.length > MAX_PASSWORD_CHARS) {
+    return res.status(400).json({ error: 'Password too long (max ' + MAX_PASSWORD_CHARS + ' characters).' });
+  }
+  const t = getTransmitter(password);
+  t.outLastOk = Date.now();
+  t.lastPollAt = Date.now();
+  notePoll(t, req);
 
   if (req.method === 'POST') {
     const bits = readInputBits(req);
-    if (bits !== null) handleControlPins(bits);
+    if (bits !== null) handleControlPins(t, bits);
   }
-  if (held !== null) return res.json({ value: held });
-  const frame = queue.length ? queue.shift() : blank(); // empty: always 00000000
-  last = frame;
-  noteSent(frame);
+  if (t.held !== null) return res.json({ value: t.held });
+  const frame = t.queue.length ? t.queue.shift() : blank(); // empty: always 00000000
+  t.last = frame;
+  noteSent(t, frame);
   res.json({ value: toValue(frame) });
 }
 
@@ -572,7 +572,7 @@ app.route('/out').get(outHandler).post(outHandler);
 
 // ======================= GROQ HELPERS =======================
 
-// Everything that sends something to the panel needs a verified key.
+// Everything that sends something to a panel needs a verified key.
 function requireKey(res) {
   if (groqKey) return true;
   res.status(409).json({ error: 'No Groq API key set yet. Paste your gsk_... key on the page first.' });
@@ -615,6 +615,14 @@ function finalizeReply(text) {
   return cut.trim();
 }
 
+function currentSystemPrompt(t) {
+  const persona = t.customPrompt !== null ? t.customPrompt : DEFAULT_PERSONA;
+  // The default persona always gets the panel rules; a custom prompt gets them
+  // only when the box is ticked.
+  if (t.customPrompt === null || t.appendRules) return persona.trim() + ' ' + PANEL_RULES;
+  return persona.trim();
+}
+
 // One Groq call. Returns { content, finishReason } where finishReason is 'stop',
 // 'length', etc. 'length' means the reply was cut off by the token budget.
 async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
@@ -652,9 +660,9 @@ async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
 // Ask for a short reply, and if it came back cut off or over-long, retry (up to
 // RETRY_LIMIT times) asking the model for a COMPLETE shorter answer. Never returns
 // a mid-word cut.
-async function askGroq(message, hist = history) {
+async function askGroq(t, message, hist = t.history) {
   const base = [
-    { role: 'system', content: currentSystemPrompt() }, // default or your custom prompt
+    { role: 'system', content: currentSystemPrompt(t) }, // default or the transmitter's prompt
     ...hist, // remembered turns (for a redo: without the answer being replaced)
     { role: 'user', content: message },
   ];
@@ -698,55 +706,81 @@ async function askGroq(message, hist = history) {
   return clean;
 }
 
+// ======================= CONVERSATION HELPERS =======================
+
+function pushHistory(t, role, content) {
+  t.history.push({ role, content });
+  const cap = MAX_HISTORY_TURNS * 2;
+  if (t.history.length > cap) t.history = t.history.slice(-cap);
+}
+
+// Throw away any AI request that is still in flight (its answer is ignored when it
+// arrives) and free the "busy" lock so new messages and REDO work straight away.
+function abandonChat(t) {
+  t.chatGen++;
+  t.chatBusy = false;
+}
+
+function clearHistory(t) {
+  t.history = [];
+  t.lastUserMessage = ''; // nothing left to redo
+  abandonChat(t);         // an answer still being written must not bring it back
+}
+
+// Ask the AI and put the exchange on the panel. Used by the web page (/api/chat) and
+// by the REDO pin. redo = true replaces the last exchange instead of adding a new one.
+// Resolves to { reply } or { interrupted: true }; throws if Groq fails.
+async function runChat(t, message, redo = false) {
+  const myGen = ++t.chatGen;
+  t.chatBusy = true;
+  const base = redo ? t.history.slice(0, -2) : t.history; // redo: leave out the old answer
+  let reply;
+  try {
+    reply = await askGroq(t, message, base);
+  } finally {
+    if (myGen === t.chatGen) t.chatBusy = false;
+  }
+  if (myGen !== t.chatGen) return { interrupted: true };
+
+  // Remember this exchange only after a successful reply.
+  if (redo) t.history = base.slice();
+  pushHistory(t, 'user', message);
+  pushHistory(t, 'assistant', reply);
+  t.lastUserMessage = message;
+
+  t.queue = []; // the new message replaces whatever was still being drawn
+  if (CLEAR_BEFORE_TEXT) t.queue.push(...clearFrames());
+
+  if (SHOW_INPUT) {
+    // Echo only characters the panel can draw, so nothing turns into '?'
+    const body = Array.from(cleanReply(message)).slice(0, ECHO_MAX_CHARS);
+    const echo = [...Array.from(ECHO_PREFIX), ...body, ...Array.from(ECHO_SUFFIX)];
+    const codes = [
+      ...echo.map(encode),
+      ...separatorCodes(echo.length),
+      ...Array.from(reply).slice(0, 200).map(encode),
+    ];
+    t.queue.push(...buildFrames(t, codes));
+  } else {
+    t.queue.push(...buildFrames(t, Array.from(reply).slice(0, 200).map(encode)));
+  }
+  return { reply };
+}
+
 // ======================= API FOR THE WEB PAGE =======================
 
 const n = (v, max) => Math.max(0, Math.min(max, Number(v) | 0));
 
-// Read the access settings (header name, password, and the exact headers dictionary
-// to paste into the game's HTTP Transmitter). The page is already password-gated.
-app.get('/api/access', (_req, res) => {
-  res.json(accessInfo());
-});
-
-// Change the password and/or the header name. The page calls this after you edit
-// the fields under "1. Transmitter access". The game's transmitter keeps using the
-// old value until you paste the new dictionary into it.
-app.post('/api/access', (req, res) => {
-  const password = String(req.body.password === undefined ? '' : req.body.password).trim();
-  const header = cleanHeaderName(req.body.header || PASSWORD_HEADER);
-
-  if (!header) {
-    return res.status(400).json({ error: 'Header name must contain at least one letter or digit.' });
-  }
-  if (header === 'host' || header === 'content-length' || header === 'connection') {
-    return res.status(400).json({ error: 'That header name is reserved by HTTP.' });
-  }
-  if (!password) {
-    return res.status(400).json({ error: 'Password cannot be empty.' });
-  }
-  if (password.length > 200) {
-    return res.status(400).json({ error: 'Password too long (max 200 characters).' });
-  }
-
-  PANEL_PASS = password;
-  PASSWORD_HEADER = header;
-
-  res.json({
-    ok: true,
-    ...accessInfo(),
-    message: 'Saved. Put the headers dictionary into the game transmitter.',
-  });
-});
-
 // Set / clear the Groq key. A non-empty key is checked against api.groq.com first,
 // so a typo is caught immediately instead of silently breaking every send.
+// The key is shared by all transmitters on this server.
 app.post('/api/key', async (req, res) => {
   const key = String(req.body.key || '').trim();
 
   if (!key) {
     groqKey = '';
-    clearHistory(); // forgetting the key also forgets the conversation
-    return res.json({ ok: true, key: false, message: 'Key forgotten. The panel is locked.' });
+    for (const t of transmitters.values()) clearHistory(t); // forgetting the key forgets every conversation
+    return res.json({ ok: true, key: false, message: 'Key forgotten. Every panel is locked.' });
   }
   if (key.length < 20) {
     return res.status(400).json({ error: 'That does not look like a Groq key (too short).' });
@@ -763,211 +797,175 @@ app.post('/api/key', async (req, res) => {
   }
 
   groqKey = key;
-  res.json({ ok: true, key: true, message: 'Key set — the panel is unlocked.' });
+  res.json({ ok: true, key: true, message: 'Key set — every panel on this server is unlocked.' });
 });
 
-// Read the prompt currently in use (the page loads this into the text box).
-app.get('/api/prompt', (_req, res) => {
+// Read the prompt currently in use by THIS transmitter (the page loads this).
+app.get('/api/prompt', (req, res) => {
+  const t = req.transmitter;
   res.json({
-    custom: customPrompt !== null,
-    prompt: customPrompt !== null ? customPrompt : DEFAULT_PERSONA.trim(),
+    custom: t.customPrompt !== null,
+    prompt: t.customPrompt !== null ? t.customPrompt : DEFAULT_PERSONA.trim(),
     defaultPrompt: DEFAULT_PERSONA.trim(),
-    appendRules,
+    appendRules: t.appendRules,
     rules: PANEL_RULES,
     maxChars: MAX_PROMPT_CHARS,
   });
 });
 
-// Set your own prompt. An empty prompt goes back to the default.
-// Changing the prompt also starts a fresh conversation, so old replies written
-// under the previous prompt don't confuse the model.
+// Set this transmitter's own prompt. An empty prompt goes back to the default.
+// Changing the prompt also starts a fresh conversation for this transmitter.
 app.post('/api/prompt', (req, res) => {
+  const t = req.transmitter;
   const prompt = String(req.body.prompt || '').trim();
   if (prompt.length > MAX_PROMPT_CHARS) {
     return res.status(400).json({ error: 'Prompt too long (max ' + MAX_PROMPT_CHARS + ' characters).' });
   }
-  if (req.body.appendRules !== undefined) appendRules = !!req.body.appendRules;
+  if (req.body.appendRules !== undefined) t.appendRules = !!req.body.appendRules;
 
-  customPrompt = prompt ? prompt : null;
-  if (customPrompt === null) appendRules = true;
-  clearHistory();
+  t.customPrompt = prompt ? prompt : null;
+  if (t.customPrompt === null) t.appendRules = true;
+  clearHistory(t);
 
   res.json({
     ok: true,
-    custom: customPrompt !== null,
-    appendRules,
-    message: customPrompt !== null ? 'Custom prompt saved. New conversation started.' : 'Back to the default prompt. New conversation started.',
+    custom: t.customPrompt !== null,
+    appendRules: t.appendRules,
+    message: t.customPrompt !== null
+      ? 'Prompt saved for this transmitter. New conversation started.'
+      : 'Back to the default prompt. New conversation started.',
   });
 });
 
-// Type a message, get a short Groq reply that can see earlier turns, and show
-// the message followed by the reply on the panel. The exchange is remembered
-// for the next call.
-// chatBusy stops two requests (button + Enter, or two tabs) from running at once.
-let chatBusy = false;
-// Bumped by every new request and by INTERRUPT. A request whose number is no longer
-// current was interrupted (or superseded): its answer is thrown away.
-let chatGen = 0;
-
-// Throw away any AI request that is still in flight (its answer is ignored when it
-// arrives) and free the "busy" lock so new messages and REDO work straight away.
-function abandonChat() {
-  chatGen++;
-  chatBusy = false;
-}
-
-// Ask the AI and put the exchange on the panel. Used by the web page (/api/chat) and
-// by the REDO pin. redo = true replaces the last exchange instead of adding a new one.
-// Resolves to { reply } or { interrupted: true }; throws if Groq fails.
-async function runChat(message, redo = false) {
-  const myGen = ++chatGen;
-  chatBusy = true;
-  const base = redo ? history.slice(0, -2) : history; // redo: leave out the old answer
-  let reply;
-  try {
-    reply = await askGroq(message, base);
-  } finally {
-    if (myGen === chatGen) chatBusy = false;
-  }
-  if (myGen !== chatGen) return { interrupted: true };
-
-  // Remember this exchange only after a successful reply.
-  if (redo) history = base.slice();
-  pushHistory('user', message);
-  pushHistory('assistant', reply);
-  lastUserMessage = message;
-
-  queue = []; // the new message replaces whatever was still being drawn
-  if (CLEAR_BEFORE_TEXT) queue.push(...clearFrames());
-
-  if (SHOW_INPUT) {
-    // Echo only characters the panel can draw, so nothing turns into '?'
-    const body = Array.from(cleanReply(message)).slice(0, ECHO_MAX_CHARS);
-    const echo = [...Array.from(ECHO_PREFIX), ...body, ...Array.from(ECHO_SUFFIX)];
-    const codes = [
-      ...echo.map(encode),
-      ...separatorCodes(echo.length),
-      ...Array.from(reply).slice(0, 200).map(encode),
-    ];
-    queue.push(...buildFrames(codes));
-  } else {
-    queue.push(...buildFrames(Array.from(reply).slice(0, 200).map(encode)));
-  }
-  return { reply };
-}
-
 app.post('/api/chat', async (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
-  if (chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
+  if (t.chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
 
   const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
   if (!message) return res.status(400).json({ error: 'Type a message first.' });
 
   let result;
   try {
-    result = await runChat(message);
+    result = await runChat(t, message);
   } catch (e) {
     return res.status(502).json({ error: e.message });
   }
-  if (result.interrupted) return res.json({ reply: '(interrupted)', interrupted: true, queued: queue.length, memory: history.length / 2 });
+  if (result.interrupted) {
+    return res.json({
+      reply: '(interrupted)',
+      interrupted: true,
+      queued: t.queue.length,
+      memory: t.history.length / 2,
+    });
+  }
 
-  res.json({ reply: result.reply, queued: queue.length, memory: history.length / 2 });
+  res.json({ reply: result.reply, queued: t.queue.length, memory: t.history.length / 2 });
 });
 
 // Same as the INTERRUPT / REDO pins, for testing from the page.
-app.post('/api/interrupt', (_req, res) => {
-  interruptResponse();
-  res.json({ ok: true, queued: queue.length });
+app.post('/api/interrupt', (req, res) => {
+  interruptResponse(req.transmitter);
+  res.json({ ok: true, queued: req.transmitter.queue.length });
 });
 
-app.post('/api/redo', (_req, res) => {
+app.post('/api/redo', (req, res) => {
   if (!requireKey(res)) return;
-  redoResponse();
-  res.json({ ok: true, action: lastAction });
+  redoResponse(req.transmitter);
+  res.json({ ok: true, action: req.transmitter.lastAction });
 });
 
-// Forget the conversation (the key is kept).
-app.post('/api/memory/clear', (_req, res) => {
-  clearHistory();
+// Forget this transmitter's conversation (the key is kept).
+app.post('/api/memory/clear', (req, res) => {
+  clearHistory(req.transmitter);
   res.json({ ok: true, memory: 0 });
 });
 
 app.post('/api/text', (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
   // Remove emoji variation selectors (arrows often arrive with one) and line breaks
   const text = String(req.body.text || '').replace(/\uFE0F/g, '').replace(/[\r\n]/g, ' ');
-  if (CLEAR_BEFORE_TEXT) queue.push(...clearFrames());
-  queue.push(...buildFrames(Array.from(text).slice(0, 200).map(encode)));
-  res.json({ queued: queue.length });
+  if (CLEAR_BEFORE_TEXT) t.queue.push(...clearFrames());
+  t.queue.push(...buildFrames(t, Array.from(text).slice(0, 200).map(encode)));
+  res.json({ queued: t.queue.length });
 });
 
-app.post('/api/clear', (_req, res) => {
+app.post('/api/clear', (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
-  lastUserMessage = ''; // REDO does nothing until a new message is sent
-  abandonChat();
-  queue.push(...clearFrames());
-  res.json({ queued: queue.length });
+  t.lastUserMessage = ''; // REDO does nothing until a new message is sent
+  abandonChat(t);
+  t.queue.push(...clearFrames());
+  res.json({ queued: t.queue.length });
 });
 
 app.post('/api/code', (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
-  queue.push(...buildFrames([n(req.body.code, 127)]));
-  res.json({ queued: queue.length });
+  t.queue.push(...buildFrames(t, [n(req.body.code, 127)]));
+  res.json({ queued: t.queue.length });
 });
 
 // Sends every code from..to in order so you can watch what each one draws
 app.post('/api/sweep', (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
   const from = n(req.body.from, 127);
   const to = Math.max(from, n(req.body.to, 127));
   const codes = [];
   for (let c = from; c <= to; c++) codes.push(c);
-  queue.push(...buildFrames(codes));
-  res.json({ queued: queue.length });
+  t.queue.push(...buildFrames(t, codes));
+  res.json({ queued: t.queue.length });
 });
 
-// Hold an exact 8-bit string on the pins (sent as typed, left to right) until released
+// Hold an exact 8-bit string on this transmitter's pins until released
 app.post('/api/hold', (req, res) => {
+  const t = req.transmitter;
   if (!requireKey(res)) return;
   const v = String(req.body.value || '');
   if (!/^[01]{8}$/.test(v)) return res.status(400).json({ error: 'need exactly 8 bits' });
-  held = v;
-  res.json({ held });
+  t.held = v;
+  res.json({ held: t.held });
 });
 
-app.post('/api/release', (_req, res) => {
-  held = null;
-  res.json({ held });
+app.post('/api/release', (req, res) => {
+  req.transmitter.held = null;
+  res.json({ held: null });
 });
 
-app.post('/api/cancel', (_req, res) => {
-  abandonChat(); // also drops an answer that is still being written
-  queue = [];
-  held = null;
+app.post('/api/cancel', (req, res) => {
+  const t = req.transmitter;
+  abandonChat(t); // also drops an answer that is still being written
+  t.queue = [];
+  t.held = null;
   res.json({ queued: 0 });
 });
 
-app.get('/api/status', (_req, res) => {
+app.get('/api/status', (req, res) => {
+  const t = req.transmitter;
   res.json({
     key: !!groqKey,
     model: GROQ_MODEL,
-    prompt: customPrompt !== null ? 'custom' : 'default',
-    memory: history.length / 2,
+    prompt: t.customPrompt !== null ? 'custom' : 'default',
+    memory: t.history.length / 2,
     memoryMax: MAX_HISTORY_TURNS,
-    polls: pollStats(),
-    sent: sentLog.join(''),
-    queued: queue.length,
-    code: last.code,
-    clear: last.clear,
-    value: held !== null ? held : toValue(last),
-    input: lastIn,
-    action: lastAction,
-    glyph: held !== null ? 'HELD (test)' : last.clear ? 'CLEAR SCREEN' : glyph(last.code),
-    auth: {
-      header: PASSWORD_HEADER,
-      dictionary: JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS }),
-      transmitterRejected: outRejected,
-      transmitterLastOk: outLastOk,
+    polls: pollStats(t),
+    sent: t.sentLog.join(''),
+    queued: t.queue.length,
+    code: t.last.code,
+    clear: t.last.clear,
+    value: t.held !== null ? t.held : toValue(t.last),
+    input: t.lastIn,
+    action: t.lastAction,
+    glyph: t.held !== null ? 'HELD (test)' : t.last.clear ? 'CLEAR SCREEN' : glyph(t.last.code),
+    transmitter: {
+      count: transmitters.size,
+      lastPollAt: t.lastPollAt || null,
+      lastPollAgoMs: t.lastPollAt ? Date.now() - t.lastPollAt : null,
+      createdAt: t.createdAt,
+      outRejected: t.outRejected,
+      outLastOk: t.outLastOk,
     },
   });
 });
@@ -998,27 +996,25 @@ const PAGE = `<!doctype html>
   .locked { border:1px solid #a33; }
   .ok { color:#6c6; }
   .bad { color:#e77; }
+  code { background:#333; padding:0 .25rem; border-radius:4px; }
   details { background:#1c1c1c; border-radius:12px; padding:1rem; }
   summary { cursor:pointer; font-weight:600; }
 </style>
 <h1>Panel Text</h1>
 
 <section id="passsec" class="locked">
-  <h2>1. Transmitter access</h2>
-  <label class="wrap">Password
-    <input id="pass" type="password" placeholder="shared password" autocomplete="off">
+  <h2>1. Connect to a transmitter</h2>
+  <label class="wrap">Your password — the value of the <code>${PASS_HEADER}</code> header in the game
+    <input id="pass" type="password" placeholder="your password" autocomplete="off">
   </label>
-  <label class="wrap">Header name
-    <input id="hdr" type="text" value="${PASSWORD_HEADER}" autocomplete="off">
-  </label>
-  <button id="unlockbtn" onclick="unlockOrSave()">Unlock</button>
+  <button id="connectbtn" onclick="connect()">Connect</button>
   <button class="gray" onclick="genPass()">Generate</button>
-  <button class="gray" onclick="lockPage()">Lock</button>
-  <small>Your in-game HTTP Transmitter must send this header with this password. Its headers field takes a <b>dictionary</b>, so paste the one below into the game.</small>
-  <div class="st">Transmitter headers dictionary:</div>
-  <textarea id="dict" class="dict" readonly spellcheck="false"></textarea>
+  <button class="gray" onclick="disconnect()">Disconnect</button>
+  <small>Type the same password you put in your in-game HTTP Transmitter. A new password creates a new transmitter (a separate panel); typing an existing one goes back to it. Each password has its own queue, conversation and prompt, so you can drive several panels from this server. Each browser tab remembers its own password, so open a second tab for a second panel.</small>
+  <div class="st">Headers dictionary for the game's HTTP Transmitter:</div>
+  <textarea id="dict" class="dict" readonly spellcheck="false" placeholder='{"pass":"your-password"}'></textarea>
   <button class="gray" onclick="copyDict()">Copy dictionary</button>
-  <div class="st" id="passst">locked</div>
+  <div class="st" id="passst">not connected</div>
 </section>
 
 <section id="keysec" class="locked">
@@ -1026,8 +1022,8 @@ const PAGE = `<!doctype html>
   <input id="key" type="password" placeholder="gsk_..." autocomplete="off">
   <button onclick="saveKey()">Save key</button>
   <button class="gray" onclick="forgetKey()">Forget key</button>
-  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart). Nothing below works until a working key is set.</small>
-  <div class="st" id="keyst">locked</div>
+  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. No panel works until a working key is set.</small>
+  <div class="st" id="keyst">not connected</div>
 </section>
 
 <section id="chatsec" class="locked">
@@ -1035,17 +1031,17 @@ const PAGE = `<!doctype html>
   <input id="msg" type="text" placeholder="Say something..." autocomplete="off">
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
-  <small>The panel shows your message first, then the reply under it. It remembers the last few messages.</small>
+  <small>The panel shows your message first, then the reply under it. It remembers the last few messages of THIS transmitter.</small>
   <div class="st" id="reply"></div>
 </section>
 
 <section id="promptsec" class="locked">
-  <h2>4. AI prompt</h2>
+  <h2>4. AI prompt (for this transmitter)</h2>
   <textarea id="prompt" placeholder="Describe how the AI should behave..."></textarea>
   <label class="wrap"><input id="rules" type="checkbox" checked>Add the panel rules (one short line, only characters the panel can draw)</label>
   <button onclick="savePrompt()">Save prompt</button>
   <button class="gray" onclick="resetPrompt()">Reset to default</button>
-  <small>Example: You are a grumpy pirate. Answer in pirate slang. Saving starts a new conversation. Leave the box empty and save to go back to the default. Kept in memory only (lost on restart).</small>
+  <small>Example: You are a grumpy pirate. Answer in pirate slang. Saving starts a new conversation on this transmitter. Leave the box empty and save to go back to the default. Kept in memory only.</small>
   <div class="st" id="promptst"></div>
 </section>
 
@@ -1103,7 +1099,7 @@ const PAGE = `<!doctype html>
 
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
-  var PASS_HEADER = '${PASSWORD_HEADER}';
+  var PASS_HEADER = '${PASS_HEADER}';
   var pass = '';
   var passSet = false;
   var keySet = false;
@@ -1112,15 +1108,11 @@ const PAGE = `<!doctype html>
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
   function storedPass() { try { return sessionStorage.getItem('panelPass') || ''; } catch (e) { return ''; } }
-  function storedHeader() { try { return sessionStorage.getItem('panelHeader') || ''; } catch (e) { return ''; } }
-  function setStored(p, h) {
-    try {
-      if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass');
-      if (h) sessionStorage.setItem('panelHeader', h); else sessionStorage.removeItem('panelHeader');
-    } catch (e) {}
+  function setStoredPass(p) {
+    try { if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass'); } catch (e) {}
   }
 
-  // Headers for every request: the JSON bits plus the panel password in its header.
+  // Headers for every request: the JSON bits plus the password in the pass header.
   function passHeaders() {
     var h = {};
     for (var k in H) h[k] = H[k];
@@ -1128,14 +1120,12 @@ const PAGE = `<!doctype html>
     return h;
   }
 
-  function dictFor(header, password) {
+  function renderDict() {
+    var el = document.getElementById('dict');
+    if (!pass) { el.value = ''; return; }
     var d = {};
-    d[header] = password;
-    return JSON.stringify(d);
-  }
-
-  function renderDict(header, password) {
-    document.getElementById('dict').value = dictFor(header, password);
+    d[PASS_HEADER] = pass;
+    el.value = JSON.stringify(d);
   }
 
   // Enable/disable everything from the two gates: password entered, key set.
@@ -1143,11 +1133,10 @@ const PAGE = `<!doctype html>
     var btns = document.querySelectorAll('button');
     for (var i = 0; i < btns.length; i++) {
       var b = btns[i];
-      if (b.closest('#passsec')) continue; // Unlock / Generate / Lock / Copy always usable
+      if (b.closest('#passsec')) continue; // Connect / Generate / Disconnect / Copy always usable
       var needKey = b.classList.contains('needs-key');
       b.disabled = !passSet || (needKey && !keySet);
     }
-    document.getElementById('unlockbtn').textContent = passSet ? 'Save changes' : 'Unlock';
     document.getElementById('keysec').className = (passSet && keySet) ? '' : 'locked';
     document.getElementById('chatsec').className = passSet ? '' : 'locked';
     document.getElementById('promptsec').className = passSet ? '' : 'locked';
@@ -1157,122 +1146,64 @@ const PAGE = `<!doctype html>
   function applyKey(on) {
     keySet = !!on;
     var box = document.getElementById('keyst');
-    box.textContent = !passSet ? 'locked (enter the panel password first)'
+    box.textContent = !passSet ? 'not connected (enter a password first)'
       : (keySet ? 'Key set - the panel is unlocked.' : 'No key set - everything is locked.');
     box.className = 'st ' + (keySet && passSet ? 'ok' : 'bad');
     applyGates();
   }
 
-  function onLocked() {
-    pass = '';
-    passSet = false;
-    keySet = false;
-    setStored('', '');
-    document.getElementById('pass').value = '';
-    document.getElementById('dict').value = '';
-    applyGates();
-    var box = document.getElementById('passst');
-    box.textContent = 'locked - enter the panel password';
-    box.className = 'st bad';
-    document.getElementById('keyst').textContent = 'locked (enter the panel password first)';
-    document.getElementById('keyst').className = 'st bad';
+  function clearStatusLines() {
     for (var i = 1; i <= 9; i++) {
       var el = document.getElementById('st' + i);
       if (el) el.textContent = '';
     }
   }
 
-  function showAccessInputs(j) {
-    document.getElementById('pass').value = j.password;
-    document.getElementById('hdr').value = j.header;
-    renderDict(j.header, j.password);
-  }
-
-  // After unlocking, pull the server's current header/password so the page and the
-  // game's dictionary always show the same thing.
-  async function syncAccess() {
-    try {
-      var r = await fetch('/api/access', { headers: passHeaders() });
-      if (!r.ok) return;
-      var j = await r.json();
-      pass = j.password;
-      PASS_HEADER = j.header;
-      setStored(pass, PASS_HEADER);
-      showAccessInputs(j);
-    } catch (e) {}
-  }
-
-  // One button: Unlock when locked, Save changes when unlocked.
-  async function unlockOrSave() {
-    var pEl = document.getElementById('pass');
-    var hEl = document.getElementById('hdr');
+  function connect() {
+    var el = document.getElementById('pass');
     var box = document.getElementById('passst');
-    var p = pEl.value.trim();
-    var h = (hEl.value.trim() || 'x-panel-password').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'x-panel-password';
-
+    var p = el.value.trim();
     if (!p) { box.textContent = 'type a password'; box.className = 'st bad'; return; }
-
-    if (!passSet) {
-      box.textContent = 'checking...';
-      box.className = 'st';
-      var headers = {};
-      for (var k in H) headers[k] = H[k];
-      headers[h] = p;
-      try {
-        var r = await fetch('/api/status', { headers: headers });
-        if (r.status === 403) { box.textContent = 'wrong password (or header name)'; box.className = 'st bad'; return; }
-        if (!r.ok) { box.textContent = 'error ' + r.status; box.className = 'st bad'; return; }
-        pass = p;
-        PASS_HEADER = h;
-        passSet = true;
-        setStored(p, h);
-        await syncAccess();
-        box.textContent = 'unlocked';
-        box.className = 'st ok';
-        applyGates();
-        refresh();
-        loadPrompt();
-      } catch (e) {
-        box.textContent = 'error: ' + e.message;
-        box.className = 'st bad';
-      }
-      return;
-    }
-
-    // Already unlocked: save the edited password / header name on the server.
-    box.textContent = 'saving...';
+    if (p.length > 200) { box.textContent = 'password too long (max 200)'; box.className = 'st bad'; return; }
+    pass = p;
+    passSet = true;
+    setStoredPass(p);
+    el.value = '';
+    renderDict();
+    box.textContent = 'connected - waiting for the game to poll with this password...';
     box.className = 'st';
-    try {
-      var r2 = await fetch('/api/access', {
-        method: 'POST',
-        headers: passHeaders(),
-        body: JSON.stringify({ password: p, header: h }),
-      });
-      var j = await r2.json();
-      if (r2.status === 403 && j.locked) { onLocked(); return; }
-      if (!r2.ok) { box.textContent = j.error || 'could not save'; box.className = 'st bad'; return; }
-      pass = j.password;
-      PASS_HEADER = j.header;
-      passSet = true;
-      setStored(pass, PASS_HEADER);
-      showAccessInputs(j);
-      box.textContent = 'saved - paste the dictionary above into the game';
-      box.className = 'st ok';
-      applyGates();
-      refresh();
-    } catch (e) {
-      box.textContent = 'error: ' + e.message;
-      box.className = 'st bad';
-    }
+    applyGates();
+    refresh();
+    loadPrompt();
+  }
+
+  function disconnect() {
+    pass = '';
+    passSet = false;
+    keySet = false;
+    setStoredPass('');
+    document.getElementById('dict').value = '';
+    document.getElementById('pass').value = '';
+    document.getElementById('reply').textContent = '';
+    document.getElementById('prompt').value = '';
+    document.getElementById('promptst').textContent = '';
+    clearStatusLines();
+    var box = document.getElementById('passst');
+    box.textContent = 'not connected';
+    box.className = 'st';
+    document.getElementById('keyst').textContent = 'not connected (enter a password first)';
+    document.getElementById('keyst').className = 'st bad';
+    applyGates();
   }
 
   function genPass() {
     var chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     var s = '';
-    for (var i = 0; i < 16; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+    for (var i = 0; i < 20; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
     document.getElementById('pass').value = s;
-    document.getElementById('passst').textContent = 'generated - click ' + (passSet ? 'Save changes' : 'Unlock');
-    document.getElementById('passst').className = 'st';
+    var box = document.getElementById('passst');
+    box.textContent = 'generated - click Connect, then paste the dictionary into the game';
+    box.className = 'st';
   }
 
   function copyDict() {
@@ -1287,13 +1218,10 @@ const PAGE = `<!doctype html>
     box.className = 'st ok';
   }
 
-  function lockPage() { onLocked(); }
-
   async function post(path, body) {
     var r = await fetch(path, { method: 'POST', headers: passHeaders(), body: JSON.stringify(body || {}) });
     var j = {};
     try { j = await r.json(); } catch (e) {}
-    if (r.status === 403 && j && j.locked) onLocked();
     refresh();
     return j;
   }
@@ -1307,7 +1235,6 @@ const PAGE = `<!doctype html>
     try {
       var r = await fetch('/api/key', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ key: k }) });
       var j = await r.json();
-      if (r.status === 403 && j.locked) { onLocked(); return; }
       if (!r.ok) { box.textContent = j.error || 'key rejected'; box.className = 'st bad'; return; }
       el.value = '';
       box.textContent = j.message || 'key saved';
@@ -1330,7 +1257,7 @@ const PAGE = `<!doctype html>
   }
 
   // ---- AI prompt ----
-  // Loaded after unlock (not on the 0.5 s refresh) so it never overwrites
+  // Loaded after connecting (not on the 0.5 s refresh) so it never overwrites
   // what you are typing.
   async function loadPrompt() {
     if (!passSet) return;
@@ -1341,7 +1268,7 @@ const PAGE = `<!doctype html>
       document.getElementById('prompt').value = p.prompt;
       document.getElementById('rules').checked = p.appendRules;
       var box = document.getElementById('promptst');
-      box.textContent = p.custom ? 'Using your custom prompt.' : 'Using the default prompt.';
+      box.textContent = p.custom ? 'Using this transmitter\'s custom prompt.' : 'Using the default prompt.';
       box.className = 'st';
     } catch (e) {}
   }
@@ -1360,7 +1287,6 @@ const PAGE = `<!doctype html>
         })
       });
       var j = await r.json();
-      if (r.status === 403 && j.locked) { onLocked(); return; }
       if (!r.ok) { box.textContent = j.error || 'could not save'; box.className = 'st bad'; return; }
       box.textContent = j.message;
       box.className = 'st ok';
@@ -1390,8 +1316,7 @@ const PAGE = `<!doctype html>
     try {
       var r = await fetch('/api/chat', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ message: msg }) });
       var j = await r.json();
-      if (r.status === 403 && j.locked) onLocked();
-      else if (!r.ok) out.textContent = 'error: ' + (j.error || r.status);
+      if (!r.ok) out.textContent = 'error: ' + (j.error || r.status);
       else { out.textContent = 'reply: ' + j.reply; box.value = ''; }
     } catch (e) {
       out.textContent = 'error: ' + e.message;
@@ -1410,23 +1335,29 @@ const PAGE = `<!doctype html>
     if (!passSet) return;
     try {
       var r = await fetch('/api/status', { headers: passHeaders() });
-      if (r.status === 403) { onLocked(); return; }
       if (!r.ok) return;
       var s = await r.json();
       applyKey(s.key);
-      document.getElementById('passst').textContent = 'unlocked';
-      document.getElementById('passst').className = 'st ok';
+      var box = document.getElementById('passst');
+      var tr = s.transmitter;
+      if (tr.lastPollAgoMs === null) {
+        box.textContent = 'connected — the game has not polled with this password yet';
+        box.className = 'st bad';
+      } else {
+        var sec = Math.round(tr.lastPollAgoMs / 1000);
+        box.textContent = 'connected — game last polled ' + (sec < 1 ? 'just now' : sec + ' s ago');
+        box.className = 'st ok';
+      }
       document.getElementById('st1').textContent = 'model: ' + s.model + ' | prompt: ' + s.prompt + ' | queued frames: ' + s.queued;
-      document.getElementById('st2').textContent = 'memory: ' + s.memory + ' / ' + s.memoryMax + ' turns';
+      document.getElementById('st2').textContent = 'memory: ' + s.memory + ' / ' + s.memoryMax + ' turns (this transmitter)';
       document.getElementById('st3').textContent = 'on the pins: code ' + s.code + ' = ' + s.glyph + ' (clear bit ' + s.clear + ')';
       document.getElementById('st4').textContent = 'value: ' + s.value;
       var p = s.polls;
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
-      document.getElementById('st6').textContent = 'callers of /out: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
+      document.getElementById('st6').textContent = 'callers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
       document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' (pin 1 = interrupt, pin 2 = redo) | last action: ' + (s.action || 'none');
-      var ago = s.auth.transmitterLastOk === null ? 'never' : Math.round((Date.now() - s.auth.transmitterLastOk) / 1000) + ' s ago';
-      document.getElementById('st9').textContent = 'transmitter headers: ' + s.auth.dictionary + ' | last good poll: ' + ago + ' | rejected polls: ' + s.auth.transmitterRejected;
+      document.getElementById('st9').textContent = 'transmitters on this server: ' + tr.count + ' | this one created ' + new Date(tr.createdAt).toLocaleString();
     } catch (e) {}
   }
 
@@ -1434,19 +1365,18 @@ const PAGE = `<!doctype html>
     if (e.key === 'Enter') sendMsg();
   });
   document.getElementById('pass').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') unlockOrSave();
+    if (e.key === 'Enter') connect();
   });
 
-  // Restore the password/header from this tab, if any. If the server no longer
-  // accepts it, the first refresh locks the page again.
+  // Restore the password from this tab, if any. If the server has since forgotten
+  // that transmitter, it just looks like a fresh empty one until the game polls.
   pass = storedPass();
-  PASS_HEADER = storedHeader() || PASS_HEADER;
   passSet = !!pass;
-  document.getElementById('hdr').value = PASS_HEADER;
   applyGates();
   if (passSet) {
-    renderDict(PASS_HEADER, pass);
-    syncAccess().then(function () { loadPrompt(); refresh(); });
+    renderDict();
+    loadPrompt();
+    refresh();
   }
   setInterval(refresh, 500);
 </script>`;
@@ -1454,12 +1384,13 @@ const PAGE = `<!doctype html>
 app.get('/', (_req, res) => res.send(PAGE));
 
 app.listen(PORT, () => {
-  const dict = JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS });
-  console.log('Panel page: http://localhost:' + PORT + '/ (open, but needs the panel password)');
+  const dictionary = JSON.stringify({ [PASS_HEADER]: '<your-password>' });
+  console.log('Panel page: http://localhost:' + PORT + '/');
   console.log('Game transmitter path: /out');
-  console.log('  Transmitter headers dictionary: ' + dict);
-  console.log('  (send that as the HTTP Transmitter headers' + (OUT_TOKEN ? ', or use ?token=...' : '') + ')');
-  console.log('Password source: ' + (process.env.PANEL_PASSWORD ? 'PANEL_PASSWORD env var (changeable on the page).' : 'default "hi10h" (change it on the page or with PANEL_PASSWORD).'));
-  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY.' : 'No Groq key yet - set one on the page.');
-  console.log(customPrompt !== null ? 'Custom prompt loaded from PANEL_PROMPT.' : 'Using the default prompt (change it on the page).');
+  console.log('  Set this header on your HTTP Transmitter:  ' + PASS_HEADER + ': <your-password>');
+  console.log('  Headers dictionary:  ' + dictionary);
+  console.log('  Each different pass value is a separate panel with its own queue.');
+  console.log('  The page itself is open. Type the same password into it to control that panel.');
+  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page.');
+  console.log(INITIAL_PROMPT !== null ? 'New transmitters start with the PANEL_PROMPT prompt.' : 'New transmitters start with the default prompt (change it per panel on the page).');
 });

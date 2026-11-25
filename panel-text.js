@@ -793,8 +793,8 @@ async function runOsChat(t, message) {
 //
 // MENU      the selected app is shown with a "▶" arrow and a position counter.
 //           UP / DOWN change it, SELECT opens it.
-// terminal  FN1 scrolls a-z and 0-9; UP accepts; FN2 inserts a space; DOWN runs.
-//           SELECT cancels the pending character, deletes, or exits when empty.
+// terminal  Uses the SAME picker as text editor: FN1 cycles space, a-z; FN2 inserts.
+//           SELECT cancels the preview, backspaces, or exits when empty; DOWN runs a command.
 // text editor  FN1 cycles SPACE, a-z (in that order); FN2 inserts the selection and
 //           advances to the next character. SELECT cancels/deletes; when empty it exits.
 //           DOWN finishes and returns to the menu. Text stays until the OS is powered off.
@@ -806,7 +806,7 @@ async function runOsChat(t, message) {
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
-const OS_VERSION = '1.1';
+const OS_VERSION = '1.2';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
 const OS_DEBOUNCE_MS = 40;   // short bounce filter; edge detection prevents held-button repeats
 
@@ -823,11 +823,11 @@ const APPS = [
   { id: 'dice', name: 'dice' },
 ];
 
-const TERM_LETTERS = 'abcdefghijklmnopqrstuvwxyz0123456789';
-const TERM_MAX = 40;
-// The editor's FN1 cycle starts with a space, followed by a through z.
+// Both terminal and text editor use the same FN1/FN2 character-entry system.
+// FN1 cycles: space, a, b, ... z. FN2 inserts the selected character.
 const EDITOR_LETTERS = ' abcdefghijklmnopqrstuvwxyz';
 const EDITOR_MAX = 120;
+const TERM_MAX = EDITOR_MAX;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 
 function makeOS() {
@@ -839,7 +839,7 @@ function makeOS() {
     screen: '',        // the line currently on the panel
     lastKey: '',
     debounce: {},      // per-key timestamps for edge-debounce
-    term: { buf: '', pending: '', out: null },
+    term: { buf: '', choice: -1, out: null },
     editor: { text: '', choice: -1 },
     dice: { side: 1, result: null },
     ai: { shown: false, text: '' },  // text = full multi-row AI answer
@@ -866,8 +866,11 @@ function osLine(t) {
     case 'term': {
       const tm = os.term;
       if (tm.out !== null) return tm.out;
-      const text = tm.buf + (tm.pending ? tm.pending.toUpperCase() : '') + '_';
-      return '> ' + text.slice(-(CHARS_PER_ROW - 2));
+      const marker = tm.choice < 0
+        ? '_'
+        : (EDITOR_LETTERS[tm.choice] === ' ' ? 'SP_' : EDITOR_LETTERS[tm.choice].toUpperCase() + '_');
+      const text = tm.buf + marker;
+      return '# ' + Array.from(text).slice(-(CHARS_PER_ROW - 2)).join('');
     }
     case 'edit': {
       const ed = os.editor;
@@ -917,7 +920,7 @@ function osPower(t, on) {
   os.cursor = 0;
   os.screen = '';
   os.lastKey = '';
-  os.term = { buf: '', pending: '', out: null };
+  os.term = { buf: '', choice: -1, out: null };
   os.editor = { text: '', choice: -1 };
   os.dice = { side: 1, result: null };
   os.ai = { shown: false, text: '' };
@@ -934,65 +937,128 @@ function osPower(t, on) {
 
 // ---- terminal ----
 
+// Accept number words because terminal input deliberately uses the same a-z + space
+// picker as the text editor (there are no digit characters in that picker).
+const NUMBER_WORDS = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
+};
+
+function parseTerminalNumber(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (/^-?\d+(?:\.\d+)?$/.test(raw)) return Number(raw);
+  return Object.prototype.hasOwnProperty.call(NUMBER_WORDS, raw)
+    ? NUMBER_WORDS[raw]
+    : NaN;
+}
+
 function runCommand(t) {
   const tm = t.os.term;
-  const line = tm.buf.trim();
+  const line = tm.buf.trim().toLowerCase();
   tm.buf = '';
-  tm.pending = '';
+  tm.choice = -1;
+  tm.out = null;
   if (!line) return;
+
   const [cmd, ...args] = line.split(/\s+/);
   const d = new Date();
   switch (cmd) {
-    case 'help': tm.out = 'echo add time'; break;
-    case 'echo': tm.out = args.join(' '); break;
-    case 'time': tm.out = pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); break;
-    case 'date': tm.out = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); break;
-    case 'ver': tm.out = 'bldos v' + OS_VERSION; break;
+    case 'help':
+    case 'commands':
+      // Kept short enough to fit on one 16-character panel row.
+      tm.out = 'echo time date';
+      break;
+    case 'echo':
+      tm.out = args.join(' ') || ' '; 
+      break;
+    case 'time':
+      tm.out = pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+      break;
+    case 'date':
+      tm.out = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      break;
+    case 'ver':
+    case 'version':
+      tm.out = 'bldos v' + OS_VERSION;
+      break;
+    case 'about':
+      tm.out = 'panel os';
+      break;
+    case 'hello':
+      tm.out = 'hello!';
+      break;
     case 'rand': {
-      const max = parseInt(args[0], 10);
-      tm.out = String(Math.floor(Math.random() * (max > 0 ? max : 100)));
+      const maxArg = args.length ? parseTerminalNumber(args[0]) : 100;
+      const max = Number.isFinite(maxArg) && maxArg > 0 ? Math.floor(maxArg) : 100;
+      tm.out = String(Math.floor(Math.random() * max));
       break;
     }
     case 'add': case 'sub': case 'mul': case 'div': {
-      const a = Number(args[0]);
-      const b = Number(args[1]);
-      if (args.length < 2 || Number.isNaN(a) || Number.isNaN(b)) { tm.out = 'err: numbers'; break; }
-      if (cmd === 'div' && b === 0) { tm.out = 'err: div by 0'; break; }
-      const res = cmd === 'add' ? a + b : cmd === 'sub' ? a - b : cmd === 'mul' ? a * b : a / b;
-      tm.out = String(Math.round(res * 1000) / 1000);
+      const a = parseTerminalNumber(args[0]);
+      const b = parseTerminalNumber(args[1]);
+      if (args.length < 2 || !Number.isFinite(a) || !Number.isFinite(b)) {
+        tm.out = 'use number words';
+        break;
+      }
+      if (cmd === 'div' && b === 0) {
+        tm.out = 'err: div by 0';
+        break;
+      }
+      const result = cmd === 'add' ? a + b
+        : cmd === 'sub' ? a - b
+        : cmd === 'mul' ? a * b
+        : a / b;
+      tm.out = String(Math.round(result * 1000) / 1000);
       break;
     }
-    case 'exit': t.os.app = 'menu'; break;
-    case 'off': osPower(t, false); break;
-    default: tm.out = 'err: ' + cmd;
+    case 'uptime': {
+      const seconds = Math.max(0, Math.floor((Date.now() - t.os.bootedAt) / 1000));
+      tm.out = seconds + ' sec';
+      break;
+    }
+    case 'clear':
+    case 'cls':
+      tm.out = '';
+      break;
+    case 'exit':
+      t.os.app = 'menu';
+      break;
+    case 'off':
+      osPower(t, false);
+      break;
+    default:
+      tm.out = 'err: ' + cmd;
   }
 }
 
 function termKey(t, key) {
   const tm = t.os.term;
-  if (tm.out !== null) { tm.out = null; return; }   // any key leaves the result
 
-  const accept = () => {
-    if (tm.pending) {
-      if (tm.buf.length < TERM_MAX) tm.buf += tm.pending;
-      tm.pending = '';
-    }
-  };
+  // Any key returns from a command result to the terminal prompt.
+  if (tm.out !== null) {
+    tm.out = null;
+    return;
+  }
 
   if (key === 'fn1') {
-    const i = tm.pending ? TERM_LETTERS.indexOf(tm.pending) : -1;
-    tm.pending = TERM_LETTERS[(i + 1) % TERM_LETTERS.length];
-  } else if (key === 'up') {
-    accept();
+    // Exactly the same character cycle as the text editor: space, then a-z.
+    tm.choice = (tm.choice + 1) % EDITOR_LETTERS.length;
   } else if (key === 'fn2') {
-    accept();
-    if (tm.buf.length > 0 && tm.buf.length < TERM_MAX && !tm.buf.endsWith(' ')) tm.buf += ' ';
+    // Insert only an explicitly selected character, then start a fresh position.
+    if (tm.choice >= 0) {
+      if (tm.buf.length < TERM_MAX) tm.buf += EDITOR_LETTERS[tm.choice];
+      tm.choice = -1;
+    }
   } else if (key === 'select') {
-    if (tm.pending) tm.pending = '';
+    // SELECT cancels the preview first; otherwise it backspaces or exits if empty.
+    if (tm.choice >= 0) tm.choice = -1;
     else if (tm.buf.length) tm.buf = tm.buf.slice(0, -1);
     else t.os.app = 'menu';
   } else if (key === 'down') {
-    accept();
+    // DOWN runs the committed command. An uncommitted preview is discarded.
+    tm.choice = -1;
     runCommand(t);
   }
 }
@@ -1031,7 +1097,7 @@ function menuKey(t, key) {
   else if (key === 'up') os.cursor = (os.cursor - 1 + APPS.length) % APPS.length;
   else if (key === 'select') {
     os.app = APPS[os.cursor].id;
-    if (os.app === 'term') os.term = { buf: '', pending: '', out: null };
+    if (os.app === 'term') os.term = { buf: '', choice: -1, out: null };
     if (os.app === 'dice') os.dice.result = rollDie(os);
     if (os.app === 'ai') {
       os.ai = { shown: false, text: '' };
@@ -1467,7 +1533,7 @@ const PAGE = `<!doctype html>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
-  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: FN1 scrolls a letter, up accepts it, FN2 = space, select = back, down = run (try: help). text editor: FN1 cycles space then a-z; FN2 inserts that character and moves to the next position; select cancels/deletes; down finishes. clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
+  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: same text-entry controls as the text editor — FN1 cycles space then a-z, FN2 inserts the selected character; SELECT cancels the preview or backspaces; DOWN runs the command. Commands: help, echo, time, date, ver, about, hello, rand, add, sub, mul, div, uptime, clear, exit, off. For math and rand limits, spell numbers (example: add five three). text editor: FN1 cycles space then a-z; FN2 inserts; SELECT cancels/deletes; DOWN finishes. clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
 </section>
 
 <details>

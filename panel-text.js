@@ -414,29 +414,52 @@ function noteSent(t, frame) {
 function readInputBits(req) {
   let v;
   const raw = req.body;
+  const pick = (obj) => {
+    if (!obj || typeof obj !== 'object') return undefined;
+    return obj.value ?? obj.bits ?? obj.input ?? obj.pins;
+  };
+
   if (raw && typeof raw === 'object') {
-    // Accept common transmitter payload variants.
-    v = raw.value ?? raw.bits ?? raw.input ?? raw.pins;
+    v = pick(raw);
   } else if (typeof raw === 'string' && raw.trim()) {
     const body = raw.trim();
     try {
-      const j = JSON.parse(body);
-      if (j && typeof j === 'object') v = j.value ?? j.bits ?? j.input ?? j.pins;
-      else v = j;
+      const parsed = JSON.parse(body);
+      v = parsed && typeof parsed === 'object' ? pick(parsed) : parsed;
     } catch (e) {
-      // Accept a bare bit string, or find an 8-bit value in other POST text.
-      const m = body.match(/[01]{8}/);
-      v = m ? m[0] : undefined;
+      // Build Logic may POST form data (value=...) or a bare bit string.
+      try {
+        const params = new URLSearchParams(body);
+        v = params.get('value') ?? params.get('bits') ?? params.get('input') ?? params.get('pins');
+      } catch (_) {}
+      if (v === undefined || v === null) {
+        const named = body.match(/(?:value|bits|input|pins)\s*[:=]\s*[\"']?([01]{1,8})/i);
+        if (named) v = named[1];
+        else if (/^[01]{1,8}$/.test(body)) v = body;
+        else {
+          const embedded = body.match(/(?:^|[^0-9])([01]{6,8})(?:$|[^0-9])/);
+          v = embedded ? embedded[1] : undefined;
+        }
+      }
     }
   }
-  if (v === undefined || v === null) v = req.query.value;
+
+  if (v === undefined || v === null) {
+    v = req.query.value ?? req.query.bits ?? req.query.input ?? req.query.pins;
+  }
   if (v === undefined || v === null) return null;
 
-  let s = String(v).trim();
-  // Some transmitters send a numeric value rather than a string of bits.
-  if (!/^[01]+$/.test(s)) return null;
-  // Keep the leftmost six OS-control pins; normalize shorter payloads too.
-  s = s.padEnd(8, '0').slice(0, 8);
+  let s;
+  // If the transmitter sends a JSON number, interpret it as an 8-bit value.
+  if (typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= 255) {
+    s = v.toString(2).padStart(8, '0');
+  } else {
+    s = String(v).trim();
+    if (!/^[01]{1,8}$/.test(s)) return null;
+    // Text bit strings are left-to-right pin states (pin 1 is the first bit).
+    s = s.padEnd(8, '0');
+  }
+
   if (PINS_ACTIVE_LOW) s = s.replace(/[01]/g, (b) => (b === '0' ? '1' : '0'));
   return REVERSE_BITS ? s.split('').reverse().join('') : s;
 }
@@ -471,8 +494,9 @@ function redoResponse(t) {
 // In AI mode pins 1-2 are INTERRUPT / REDO; in OS mode pins 1-6 are the OS keys.
 function handleControlPins(t, bits) {
   t.lastIn = bits;
+  let osActionHandled = false;
   if (t.mode === 'os') {
-    osPins(t, bits); // OS edge detection handles its own baseline
+    osActionHandled = osPins(t, bits); // OS edge detection handles its own baseline
   } else if (t.prevIn !== null) {
     const rose = (i) => bits[i] === '1' && t.prevIn[i] === '0';
     if (rose(PIN_INTERRUPT)) interruptResponse(t);
@@ -481,6 +505,7 @@ function handleControlPins(t, bits) {
   // AI mode: the first POST only sets the baseline, so a pin that is already high at
   // start does nothing. (OS mode already handled the first POST inside osPins.)
   t.prevIn = bits;
+  return osActionHandled;
 }
 
 // The game calls this. The pass header chooses the transmitter. Pins can come from a
@@ -507,9 +532,23 @@ function outHandler(req, res) {
 
   // Pins work on GET as well as POST now.
   const bits = readInputBits(req);
-  if (bits !== null) handleControlPins(t, bits);
+  const osButtonHandled = bits !== null && handleControlPins(t, bits);
 
   if (t.held !== null) return res.json({ value: t.held });
+
+  // A transmitter POST both delivers the button state and receives the next display
+  // frame. Do not send the clear pulse in that same response: some transmitter setups
+  // apply the response before their button-state update has settled. Return one idle
+  // frame for the input poll, leaving the clear + redraw sequence at the front of the
+  // queue for the NEXT poll. The web-page buttons already use a separate request and
+  // therefore continue to receive the clear frame on their next normal poll.
+  if (osButtonHandled) {
+    const frame = blank();
+    t.last = frame;
+    noteSent(t, frame);
+    return res.json({ value: toValue(frame) });
+  }
+
   const frame = t.queue.length ? t.queue.shift() : blank(); // empty: always 00000000
   t.last = frame;
   noteSent(t, frame);
@@ -975,15 +1014,15 @@ function osKey(t, key) {
   if (key === 'power') {
     osPower(t, !t.os.power);
     noteAction(t, 'OS power ' + (t.os.power ? 'on' : 'off'));
-    return;
+    return true;
   }
 
   const last = (t.os.debounce && t.os.debounce[key]) || 0;
-  if (now - last < OS_DEBOUNCE_MS) return;   // debounce: ignore bounce / double-fire
+  if (now - last < OS_DEBOUNCE_MS) return false;   // debounce: ignore bounce / double-fire
   if (!t.os.debounce) t.os.debounce = {};
   t.os.debounce[key] = now;
 
-  if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return; }
+  if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return false; }
 
   t.os.lastKey = key;
   const before = t.os.app;
@@ -991,12 +1030,13 @@ function osKey(t, key) {
   else if (before === 'term') termKey(t, key);
   else appKey(t, key);
 
-  if (!t.os.power) { noteAction(t, 'OS off (terminal)'); return; }   // the "off" command
+  if (!t.os.power) { noteAction(t, 'OS off (terminal)'); return true; }   // the "off" command
 
   // Clear + redraw on EVERY accepted key, even if the line is identical.
   if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
   else osDraw(t, osLine(t));
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
+  return true;
 }
 
 // Input pins in OS mode. A pin only fires on its rising edge, but the very first POST
@@ -1006,12 +1046,17 @@ function osPins(t, bits) {
   // POST input is a button-state snapshot. Treat a 0->1 transition as a click,
   // just like the browser's /api/os/key buttons; holding a button won't repeat.
   const prev = t.prevIn || '00000000';
+  let handled = false;
   for (let i = 0; i < OS_PINS.length; i++) {
     const name = OS_PINS[i];
     const rose = bits[i] === '1' && prev[i] === '0';
     const fell = bits[i] === '0' && prev[i] === '1';
-    if (rose || (name === 'power' && POWER_ON_FALLING_EDGE && fell)) osKey(t, name);
+    if (rose || (name === 'power' && POWER_ON_FALLING_EDGE && fell)) {
+      // Report only keys that actually ran (not debounced / ignored presses).
+      if (osKey(t, name)) handled = true;
+    }
   }
+  return handled;
 }
 
 // ======================= API FOR THE WEB PAGE =======================

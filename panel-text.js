@@ -56,9 +56,11 @@
 // The FIRST characters of what you send are the input pins (first pin = leftmost).
 //   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
 //   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
-// All of them act once on the rising edge (0 -> 1), so holding a pin high does not
-// repeat. Pins that are not used are ignored. GET /out without a value also works (no
-// inputs). If your buttons read 0 when pressed, set PINS_ACTIVE_LOW = true below.
+// AI controls act on rising edges. OS controls act on a changed pin state; the per-key
+// debounce filters the release of an ordinary short press, while allowing latching
+// switches to trigger on both positions. A request with no input value is output-only
+// and does not change the remembered inputs. If buttons read 0 when pressed, set
+// PINS_ACTIVE_LOW = true below.
 //
 // The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
 // by all transmitters on this server. The rest of the simulated OS does NOT need a key.
@@ -489,9 +491,8 @@ function redoResponse(t) {
   });
 }
 
-// A pin only fires on its rising edge (0 -> 1), so a transmitter that keeps
-// POSTing the same "1" does not trigger it again on every poll.
-// In AI mode pins 1-2 are INTERRUPT / REDO; in OS mode pins 1-6 are the OS keys.
+// AI mode controls fire on rising edges. OS mode accepts either input transition,
+// which supports latching transmitter switches as well as momentary buttons.
 function handleControlPins(t, bits) {
   t.lastIn = bits;
   let osActionHandled = false;
@@ -530,9 +531,11 @@ function outHandler(req, res) {
   if (!rawSent && req.query.value !== undefined) rawSent = '?value=' + String(req.query.value);
   t.lastRaw = rawSent;
 
-  // Pins work on GET as well as POST now.
+  // Process input only when this request actually contains a pin snapshot.
+  // A GET /out with no value is an output poll, NOT proof that every input is low.
+  // Keeping the last known snapshot lets latching switches report their falling edge.
   const bits = readInputBits(req);
-  const osButtonHandled = bits !== null && handleControlPins(t, bits);
+  const osButtonHandled = bits === null ? false : handleControlPins(t, bits);
 
   if (t.held !== null) return res.json({ value: t.held });
 
@@ -768,9 +771,10 @@ async function runOsChat(t, message) {
 // Every handled key press clears the panel first, then the current line is written
 // (even if the text did not change), so no leftovers can survive a button press.
 //
-// KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires once, when its
-// pin goes from 0 to 1, with a short debounce so button bounce cannot double-fire. The
-// power key is the exception: it is a toggle and always responds.
+// KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires when its
+// input state changes. A short per-key debounce ignores the release edge of a quick
+// momentary press and filters switch bounce. Latching switches can trigger on both
+// transitions, so they can be used as transmitter buttons too.
 //   pin 1  I/O     on / off. Off = blank screen until you press it again.
 //   pin 2  DOWN
 //   pin 3  UP
@@ -796,13 +800,11 @@ const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai'
 
 const OS_VERSION = '1.0';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
-const OS_DEBOUNCE_MS = 150;   // ignore the same key pressed again within this window
+const OS_DEBOUNCE_MS = 350;  // filters a momentary button's release edge and switch bounce
 
-// Set true only if your in-game power control is a latching toggle that stays high
-// while the OS is on. Then the power key also fires on the falling edge (high -> low),
-// so the same switch can turn the OS off again. Leave false for a momentary button:
-// with a momentary button, the falling edge would toggle power a second time.
-const POWER_ON_FALLING_EDGE = false;
+// OS transmitter inputs accept either transition. This supports both latching
+// switches (on/off transitions) and momentary buttons (the release transition is
+// ignored by OS_DEBOUNCE_MS when it follows the press quickly).
 
 const APPS = [
   { id: 'ai', name: 'ai chat' },
@@ -1009,18 +1011,19 @@ function appKey(t, key) {
 // One key press, from a pin or from the web page's test buttons.
 function osKey(t, key) {
   const now = Date.now();
+  const last = (t.os.debounce && t.os.debounce[key]) || 0;
 
-  // Power is a toggle and must always respond, even right after another key.
+  // Debounce every key, including power. This prevents a momentary button's release
+  // edge from immediately undoing the press, while still allowing later switch changes.
+  if (OS_DEBOUNCE_MS > 0 && now - last < OS_DEBOUNCE_MS) return false;
+  if (!t.os.debounce) t.os.debounce = {};
+  t.os.debounce[key] = now;
+
   if (key === 'power') {
     osPower(t, !t.os.power);
     noteAction(t, 'OS power ' + (t.os.power ? 'on' : 'off'));
     return true;
   }
-
-  const last = (t.os.debounce && t.os.debounce[key]) || 0;
-  if (now - last < OS_DEBOUNCE_MS) return false;   // debounce: ignore bounce / double-fire
-  if (!t.os.debounce) t.os.debounce = {};
-  t.os.debounce[key] = now;
 
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return false; }
 
@@ -1039,23 +1042,21 @@ function osKey(t, key) {
   return true;
 }
 
-// Input pins in OS mode. A pin only fires on its rising edge, but the very first POST
-// after start / after a mode switch counts as a press for any pin that is already high,
-// so the physical buttons behave like the web page buttons (which fire on every click).
+// Input pins in OS mode. A state change on either edge is a button action.
+// This is important for latching/toggle-style transmitter controls: one click may
+// change 0 -> 1 and the next click may change 1 -> 0. For momentary buttons, the
+// release edge usually arrives within OS_DEBOUNCE_MS and is ignored, so one press
+// still produces one action. A GET /out with no value does not change this baseline.
 function osPins(t, bits) {
-  // POST input is a button-state snapshot. Treat a 0->1 transition as a click,
-  // just like the browser's /api/os/key buttons; holding a button won't repeat.
   const prev = t.prevIn || '00000000';
   let handled = false;
+
   for (let i = 0; i < OS_PINS.length; i++) {
     const name = OS_PINS[i];
-    const rose = bits[i] === '1' && prev[i] === '0';
-    const fell = bits[i] === '0' && prev[i] === '1';
-    if (rose || (name === 'power' && POWER_ON_FALLING_EDGE && fell)) {
-      // Report only keys that actually ran (not debounced / ignored presses).
-      if (osKey(t, name)) handled = true;
-    }
+    const changed = bits[i] !== prev[i];
+    if (changed && osKey(t, name)) handled = true;
   }
+
   return handled;
 }
 

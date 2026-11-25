@@ -9,7 +9,7 @@
 //
 //   OS mode: a SIMULATED operating system (nothing real runs, it all happens in this
 //   script). The pins the transmitter POSTs are the keys of the machine:
-//        pin 1 = I/O     (on / off; a switch: high = on, see OS_POWER_MODE)
+//        pin 1 = I/O     (on / off; push button or switch, see OS_POWER_MODE)
 //        pin 2 = DOWN
 //        pin 3 = UP
 //        pin 4 = SELECT  (open / go back)
@@ -133,9 +133,9 @@ const CLEAR_SETTLE = 1;
 const SHOW_INPUT = true;
 
 // How many characters fit on ONE row of your panel before it wraps. The OS also uses
-// this as its screen width. 4 is a guess: send "abcdefghijklmnop" from Manual tools,
+// this as its screen width. 16 = a grid of 16 characters per row (16 rows). If that is wrong: send "abcdefghijklmnop" from Manual tools,
 // count the letters on the first row, and put that number here.
-const CHARS_PER_ROW = 4;
+const CHARS_PER_ROW = 16;
 
 // If your in-game panel has a code that moves the cursor to the next line,
 // put it here (0-127) and padding is skipped. Leave null otherwise.
@@ -687,7 +687,7 @@ async function runChat(t, message, redo = false) {
 //
 // KEYS (pins 1-6 of the value POSTed to /out, in OS mode)
 //   I/O    (pin 1) switches the machine on/off (off = blank screen, state forgotten).
-//          Default: pin high = on, pin low = off. Set OS_POWER_MODE to 'toggle' for a push button.
+//          Works with a push button (tap = flip) or a switch (see OS_POWER_MODE).
 //   DOWN / UP / SELECT / FN1 / FN2: behaviour depends on the app, see below.
 //
 // HOME SCREEN   DOWN / UP move the highlight (the highlighted app is in CAPITALS),
@@ -716,12 +716,20 @@ async function runChat(t, message, redo = false) {
 // Set the defaults here, or change them live in section 5 of the page ("Layout"), which
 // also has a grid test so you can count them. Every application sits on its own row.
 const OS_DEFAULT_COLS = CHARS_PER_ROW || 4;
-const OS_DEFAULT_ROWS = 4;
+const OS_DEFAULT_ROWS = 16;
 
 // How the I/O (power) pin behaves:
-//   'level'  the pin is a switch: pin high = on, pin low = off
-//   'toggle' the pin is a push button: every press flips on/off
-const OS_POWER_MODE = 'level';
+//   'auto'   works with both a push button and a latching switch (default):
+//            every time the pin goes high the power flips; if the pin was then held
+//            high for OS_SWITCH_HOLD_MS or longer (a switch left on), going low turns
+//            it off again. A quick tap of a push button never turns it off on release.
+//   'toggle' every time the pin goes high the power flips, nothing else
+//   'level'  the pin is a pure switch: high = on, low = off (a push button won't work)
+const OS_POWER_MODE = 'auto';
+const OS_SWITCH_HOLD_MS = 800;
+
+// Show a short "boot" splash when powering on. Off by default: every character costs polls.
+const OS_SPLASH = false;
 
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
@@ -736,10 +744,10 @@ const TERM_MAX = 40;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 
 const APPS = [
-  { id: 'term', name: 'term' },
-  { id: 'clok', name: 'clok' },
-  { id: 'dice', name: 'dice' },
-  { id: 'info', name: 'info' },
+  { id: 'term', name: 'term', label: 'terminal' },
+  { id: 'clok', name: 'clok', label: 'clock' },
+  { id: 'dice', name: 'dice', label: 'dice' },
+  { id: 'info', name: 'info', label: 'info' },
 ];
 
 function makeOS() {
@@ -788,7 +796,7 @@ function homeRows(t) {
   if (os.cursor >= os.top + rows) os.top = os.cursor - rows + 1;
   return APPS.slice(os.top, os.top + rows).map((a, i) => {
     const sel = os.top + i === os.cursor;
-    if (cols >= 5) return (sel ? '▶' : ' ') + a.name.slice(0, cols - 1);
+    if (cols >= 5) return (sel ? '▶' : ' ') + (cols >= 9 ? a.label : a.name).slice(0, cols - 1);
     const name = a.name.slice(0, cols);
     return sel ? name.toUpperCase() : name;
   });
@@ -872,10 +880,12 @@ function osPower(t, on) {
   if (on) {
     t.os.power = true;
     t.os.bootedAt = Date.now();
-    t.queue.push(...buildFrames(t, osCodes(t, ['boot'])));   // splash
+    if (OS_SPLASH) {
+      t.queue.push(...buildFrames(t, osCodes(t, ['boot'])));   // splash
+      t.queue.push(...clearFrames());
+    }
     const rows = osRows(t);
     t.os.screen = rows.slice(0, t.layout.rows);
-    t.queue.push(...clearFrames());
     t.queue.push(...buildFrames(t, osCodes(t, rows)));       // home screen
     noteAction(t, 'OS power ON');
   } else {
@@ -1041,14 +1051,22 @@ function osKey(t, key) {
 function osPins(t, bits) {
   const prev = t.prevIn;
   const high = (b, i) => b[i] === '1';
-  if (OS_POWER_MODE === 'level') {
-    const on = high(bits, 0);
-    if (prev === null) { if (on && !t.os.power) osPower(t, true); }
-    else if (on !== high(prev, 0)) osPower(t, on);   // switch flipped
-  } else if (prev !== null && high(bits, 0) && !high(prev, 0)) {
-    osKey(t, 'power');
+  const on = high(bits, 0);
+
+  if (prev === null) {
+    if (on) { t.powerRiseAt = Date.now(); if (!t.os.power) osPower(t, true); }
+  } else if (on !== high(prev, 0)) {
+    if (OS_POWER_MODE === 'level') {
+      osPower(t, on);
+    } else if (on) {
+      t.powerRiseAt = Date.now();
+      osKey(t, 'power');                                   // pin went high: flip
+    } else if (OS_POWER_MODE === 'auto' && t.os.power && Date.now() - (t.powerRiseAt || 0) >= OS_SWITCH_HOLD_MS) {
+      osPower(t, false);                                   // a switch that was left on was turned off
+    }
   }
-  if (prev === null) return;
+
+  if (prev === null) return; // first POST only sets the baseline for the other keys
   for (let i = 1; i < OS_PINS.length; i++) {
     if (high(bits, i) && !high(prev, i)) osKey(t, OS_PINS[i]);
   }
@@ -1179,7 +1197,7 @@ app.post('/api/os/mode', (req, res) => {
   t.mode = mode;
   t.queue = [];
   // an I/O switch that is already on when you enter OS mode powers it up
-  if (mode === 'os' && OS_POWER_MODE === 'level' && t.lastIn && t.lastIn[0] === '1' && !t.os.power) osPower(t, true);
+  if (mode === 'os' && OS_POWER_MODE !== 'toggle' && t.lastIn && t.lastIn[0] === '1' && !t.os.power) osPower(t, true);
   else if (mode === 'os' && t.os.power) osRefresh(t);
   else t.queue.push(...clearFrames());
   noteAction(t, 'mode: ' + mode);
@@ -1396,6 +1414,7 @@ const PAGE = `<!doctype html>
     <button onclick="osKey('fn2')">FN2 (6)</button>
   </div>
   <div class="st" id="osst"></div>
+  <div class="st" id="ospins"></div>
   <div class="st">Layout (must match your panel):</div>
   <label>chars per row <input id="lcols" type="number" min="1" max="64" value="4"></label>
   <label>rows <input id="lrows" type="number" min="1" max="16" value="4"></label>
@@ -1737,6 +1756,10 @@ const PAGE = `<!doctype html>
         ? 'mode: simulated OS (pins 1-6 are keys) | I/O: ' + (s.os.power ? 'on, app: ' + s.os.app : 'off')
         : 'mode: AI text sender (pins 1-2 are interrupt / redo)';
       document.getElementById('osmodebtn').textContent = s.mode === 'os' ? 'Switch back to AI mode' : 'Switch to OS mode';
+      var names = ['I/O', 'down', 'up', 'select', 'fn1', 'fn2'];
+      var pinTxt = [];
+      for (var q = 0; q < names.length; q++) pinTxt.push(names[q] + '=' + (s.input ? s.input.charAt(q) : '?'));
+      document.getElementById('ospins').textContent = 'pins from game: ' + pinTxt.join(' ') + ' (a key only fires when its pin goes 0 to 1)';
       var scr = document.getElementById('osscreen');
       if (s.mode !== 'os') scr.textContent = '(AI mode)';
       else if (!s.os.power) scr.textContent = '(power off)';

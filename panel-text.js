@@ -58,7 +58,7 @@ app.use((req, res, next) => {
 });
 
 // /out reads the body as raw text whatever the Content-Type is (see readInputBits).
-app.use(['/out', '/keys', '/key'], express.text({ type: () => true }));
+app.use(['/out', '/keys', '/key', '/keyboard', '/letter'], express.text({ type: () => true }));
 app.use(express.json());
 
 function givenPassword(req) {
@@ -1250,42 +1250,69 @@ function inputPanel(req, res) {
   return getTransmitter(password);
 }
 
-// BANK ENDPOINTS: each POST-only device supplies its own eight pin states.
-app.post('/keys/:bank', (req, res) => {
+// KEYBOARD INPUT ROUTES
+// Accept POST (recommended) and GET (compatibility) so a transmitter configured
+// with either method does not fail with "Cannot GET/POST". These routes NEVER
+// return panel display frames; only /out supplies the display stream.
+function handleKeyboardEndpoint(req, res, routeName) {
   const t = inputPanel(req, res);
   if (!t) return;
-  const bank = KEY_BANKS.find((item) => item.id === String(req.params.bank));
-  if (!bank) return res.status(404).json({ error: 'Unknown keyboard bank. Use /keys/1 through /keys/4.' });
-  const bits = readInputBits(req);
-  if (bits === null) return res.status(400).json({ error: 'Send an 8-bit value, e.g. {"value":"10000000"}.' });
 
-  const prev = t.keyBankPrev.get(bank.id) || '00000000';
-  const rising = [];
-  for (let i = 0; i < 8; i++) {
-    if (bits[i] === '1' && prev[i] === '0' && bank.keys[i]) rising.push(bank.keys[i]);
+  const name = String(routeName || '').toLowerCase();
+  const bank = KEY_BANKS.find((item) => item.id === name);
+
+  if (bank) {
+    const bits = readInputBits(req);
+    if (bits === null) {
+      return res.status(400).json({
+        error: 'Missing/invalid pin state. Send an 8-bit value, e.g. {"value":"10000000"}.'
+      });
+    }
+
+    const prev = t.keyBankPrev.get(bank.id) || '00000000';
+    const rising = [];
+    for (let i = 0; i < 8; i++) {
+      if (bits[i] === '1' && prev[i] === '0' && bank.keys[i]) rising.push(bank.keys[i]);
+    }
+    t.keyBankPrev.set(bank.id, bits);
+
+    if (rising.length > 1) {
+      noteAction(t, 'keyboard bank ' + bank.id + ' ignored simultaneous keys: ' + rising.join('+'));
+    } else if (rising.length === 1) {
+      dispatchKeyboardKey(t, rising[0]);
+    }
+    return res.status(204).end();
   }
-  t.keyBankPrev.set(bank.id, bits);
-  if (rising.length > 1) {
-    noteAction(t, 'keyboard bank ' + bank.id + ' ignored simultaneous keys: ' + rising.join('+'));
-  } else if (rising.length === 1) {
-    dispatchKeyboardKey(t, rising[0]);
+
+  // Also support /keys/a, /keys/b, ... /keys/z, /keys/enter as aliases.
+  if (/^(?:[a-z]|enter)$/.test(name)) {
+    const pressed = readPressed(req);
+    if (pressed === null) {
+      return res.status(400).json({
+        error: 'For a single-key endpoint send {"pressed":true} on press and {"pressed":false} on release.'
+      });
+    }
+    const prev = t.directKeyPrev.get(name) || false;
+    t.directKeyPrev.set(name, pressed);
+    if (pressed && !prev) dispatchKeyboardKey(t, name);
+    return res.status(204).end();
   }
-  // This is an input-only transmitter. Never return panel data on this endpoint.
-  return res.status(204).end();
+
+  return res.status(404).json({
+    error: 'Unknown keyboard endpoint. Use /keys/1 through /keys/4, or /key/a through /key/z and /key/enter.'
+  });
+}
+
+// Four 8-pin banks: /keys/1 ... /keys/4 (POST preferred; GET also accepted).
+// Alias paths /keyboard/1 ... /keyboard/4 are supported too.
+app.all(['/keys/:name', '/keyboard/:name'], (req, res) => {
+  handleKeyboardEndpoint(req, res, req.params.name);
 });
 
-// INDIVIDUAL ENDPOINTS: /key/a ... /key/z and /key/enter.
-app.post('/key/:key', (req, res) => {
-  const t = inputPanel(req, res);
-  if (!t) return;
-  const key = String(req.params.key || '').toLowerCase();
-  if (!/^(?:[a-z]|enter)$/.test(key)) return res.status(404).json({ error: 'Use /key/a through /key/z or /key/enter.' });
-  const pressed = readPressed(req);
-  if (pressed === null) return res.status(400).json({ error: 'Send {"pressed":true} on press and {"pressed":false} on release.' });
-  const prev = t.directKeyPrev.get(key) || false;
-  t.directKeyPrev.set(key, pressed);
-  if (pressed && !prev) dispatchKeyboardKey(t, key);
-  return res.status(204).end();
+// Individual input endpoints, with two naming styles:
+// /key/a ... /key/z, /key/enter and /letter/a ... /letter/z, /letter/enter.
+app.all(['/key/:key', '/letter/:key'], (req, res) => {
+  handleKeyboardEndpoint(req, res, req.params.key);
 });
 
 // ======================= API FOR THE WEB PAGE =======================
@@ -2010,12 +2037,23 @@ const PAGE = `<!doctype html>
 
 app.get('/', (_req, res) => res.send(PAGE));
 
+// Explain unknown paths instead of Express's generic HTML "Cannot POST" page.
+app.use((req, res) => {
+  console.warn('[404] ' + req.method + ' ' + req.originalUrl + ' from ' + req.ip);
+  res.status(404).json({
+    error: 'Endpoint not found: ' + req.method + ' ' + req.path,
+    displayEndpoint: 'GET or POST /out',
+    keyboardBanks: 'POST (or GET) /keys/1 through /keys/4',
+    individualKeys: 'POST (or GET) /key/a through /key/z and /key/enter'
+  });
+});
+
 app.listen(PORT, () => {
   const dictionary = JSON.stringify({ [PASS_HEADER]: '<your-password>' });
   console.log('Panel page: http://localhost:' + PORT + '/');
   console.log('Default display transmitter: /out (GET or POST; the only endpoint that returns display frames).');
-  console.log('Auxiliary keyboard transmitters: POST /keys/1, /keys/2, /keys/3, /keys/4 (same pass header; no response body).');
-  console.log('Optional single-key POST paths: /key/a ... /key/z and /key/enter.');
+  console.log('Auxiliary keyboard transmitters: /keys/1 through /keys/4 (POST recommended; GET also accepted; no display output).');
+  console.log('Individual-key aliases: /key/a ... /key/z and /key/enter (also /keys/a ... /keys/z and /keys/enter).');
   console.log('Hardware count: 1 display + 4 keyboard = 5 total.');
   console.log('  Set this header on your HTTP Transmitter:  ' + PASS_HEADER + ': <your-password>');
   console.log('  Headers dictionary:  ' + dictionary);

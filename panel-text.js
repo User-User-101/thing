@@ -11,7 +11,7 @@
 //   script). The panel shows ONE line. The pins the transmitter POSTs are the keys:
 //        pin 1 = I/O (on / off; off = blank screen until pressed again)
 //        pin 2 = DOWN    pin 3 = UP    pin 4 = SELECT    pin 5 = FN1    pin 6 = FN2
-//   UP / DOWN change the selected app, SELECT opens it. Apps: terminal, clock, dice.
+//   UP / DOWN change the selected app, SELECT opens it. Apps: ai chat, terminal, clock, dice.
 //   Every screen change clears the panel first. Details in the SIMULATED OS section below.
 //
 // The conversation (AI mode) is remembered server-side (the last MAX_HISTORY_TURNS
@@ -59,8 +59,8 @@
 // All of them act once on the rising edge (0 -> 1), so holding a pin high does not
 // repeat. Pins that are not used are ignored. GET /out also works (no inputs).
 //
-// The Groq API key is REQUIRED for AI mode and is shared by all transmitters on this
-// server. The simulated OS does NOT need a key.
+// The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
+// by all transmitters on this server. The rest of the simulated OS does NOT need a key.
 //
 // Output is an 8-bit string, leftmost bit first:
 //   X S C5 C4 C3 C2 C1 C0
@@ -678,14 +678,38 @@ async function runChat(t, message, redo = false) {
   return { reply };
 }
 
+// Ask the AI for the OS "ai chat" app: puts the reply + hint on the panel.
+async function runOsChat(t, message) {
+  const myGen = ++t.chatGen;
+  t.chatBusy = true;
+  let reply;
+  try {
+    reply = await askGroq(t, message);
+  } finally {
+    if (myGen === t.chatGen) t.chatBusy = false;
+  }
+  if (myGen !== t.chatGen) return { interrupted: true };
+  if (t.mode !== 'os' || t.os.app !== 'ai' || !t.os.power) return { interrupted: true };
+
+  pushHistory(t, 'user', message);
+  pushHistory(t, 'assistant', reply);
+  t.lastUserMessage = message;
+
+  const display = padToRow(cleanReply(reply)) + '(click select to exit)';
+  osAiDraw(t, display);
+  t.os.ai.shown = true;
+  return { reply };
+}
+
 // ======================= SIMULATED OS =======================
 //
 // A very small pretend OS (nothing real runs). The screen is ONE line of text, at most
-// CHARS_PER_ROW characters. Every time the screen changes the panel is cleared first, then
-// the new line is written, so you never see leftovers from the previous screen.
+// CHARS_PER_ROW characters, except the AI app which uses the whole panel.
+// Every time the screen changes the panel is cleared first, then the new line is written,
+// so you never see leftovers from the previous screen.
 //
 // KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires once, when its
-// pin goes from 0 to 1.
+// pin goes from 0 to 1, with a short debounce so button bounce cannot double-fire.
 //   pin 1  I/O     on / off. Off = blank screen until you press it again.
 //   pin 2  DOWN
 //   pin 3  UP
@@ -693,11 +717,16 @@ async function runChat(t, message, redo = false) {
 //   pin 5  FN1
 //   pin 6  FN2
 //
-// MENU      only the selected app is shown. UP / DOWN change it, SELECT opens it.
+// MENU      the selected app is shown with a "▶" arrow and a position counter (1/4).
+//           UP / DOWN change it, SELECT opens it.
 // terminal  FN1 scrolls the letter (a-z, 0-9; shown in CAPITALS), UP accepts it, FN2 = space,
 //           SELECT = back (deletes; on an empty line it returns to the menu),
-//           DOWN = run the line. The result is one line; any key goes back to typing.
+//           DOWN = run the line. The prompt shows ">" and a "_" cursor.
+//           The result is one line; any key goes back to typing.
 //           Commands: help echo time date rand add sub mul div ver exit off
+// ai chat   Uses the Groq key. You type on the WEB PAGE ("3. Message"), the panel
+//           shows the answer with "(click select to exit)" at the end.
+//           SELECT = back to the menu.
 // clock     shows the time. FN1 refreshes. SELECT = back.
 // dice      FN1 rolls. UP / DOWN pick the die. SELECT = back.
 
@@ -706,8 +735,10 @@ const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai'
 
 const OS_VERSION = '1.0';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
+const OS_DEBOUNCE_MS = 150;   // ignore the same key pressed again within this window
 
 const APPS = [
+  { id: 'ai', name: 'ai chat' },
   { id: 'term', name: 'terminal' },
   { id: 'clok', name: 'clock' },
   { id: 'dice', name: 'dice' },
@@ -725,24 +756,35 @@ function makeOS() {
     bootedAt: 0,
     screen: '',        // the line currently on the panel
     lastKey: '',
+    debounce: {},      // per-key timestamps for edge-debounce
     term: { buf: '', pending: '', out: null },
     dice: { side: 1, result: null },
+    ai: { shown: false },  // true once an AI answer has been drawn
   };
 }
 
 const pad2 = (v) => String(v).padStart(2, '0');
 const rollDie = (os) => 1 + Math.floor(Math.random() * DICE_SIDES[os.dice.side]);
 
+// Pad a line so a following line starts on a new row (the panel wraps by itself).
+function padToRow(text) {
+  const len = Array.from(text).length;
+  if (len === 0) return text;
+  const pad = (CHARS_PER_ROW - (len % CHARS_PER_ROW)) % CHARS_PER_ROW;
+  return text + ' '.repeat(pad);
+}
+
 // The one line the current app wants on the screen
 function osLine(t) {
   const os = t.os;
   switch (os.app) {
     case 'menu':
-      return APPS[os.cursor].name;
+      return '▶ ' + APPS[os.cursor].name + ' ' + (os.cursor + 1) + '/' + APPS.length;
     case 'term': {
       const tm = os.term;
       if (tm.out !== null) return tm.out;
-      return (tm.buf + (tm.pending ? tm.pending.toUpperCase() : '_')).slice(-CHARS_PER_ROW);
+      const text = tm.buf + (tm.pending ? tm.pending.toUpperCase() : '') + '_';
+      return '> ' + text.slice(-(CHARS_PER_ROW - 2));
     }
     case 'clok': {
       const d = new Date();
@@ -750,6 +792,8 @@ function osLine(t) {
     }
     case 'dice':
       return 'd' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result);
+    case 'ai':
+      return os.ai.shown ? os.screen : 'ask me';
     default:
       return 'err';
   }
@@ -764,12 +808,30 @@ function osDraw(t, line) {
   if (text.length) t.queue.push(...buildFrames(t, text.map(encode)));
 }
 
-// I/O key: on = menu, off = blank screen (the OS forgets everything)
+// Clear the panel, then write one multi-row block (used by the AI app).
+function osAiDraw(t, text) {
+  const chars = Array.from(String(text)).slice(0, CHARS_PER_ROW * 8);
+  t.os.screen = chars.slice(0, CHARS_PER_ROW).join('');
+  t.queue = [];
+  t.queue.push(...clearFrames());
+  if (chars.length) t.queue.push(...buildFrames(t, chars.map(encode)));
+}
+
+// I/O key: on = menu, off = blank screen (the OS forgets everything).
+// Mutates t.os instead of replacing it, so the debounce map survives toggles.
 function osPower(t, on) {
-  t.os = makeOS();
+  const os = t.os;
+  if (!!os.power === !!on) return;   // already in that state
+  os.power = !!on;
+  os.app = 'menu';
+  os.cursor = 0;
+  os.screen = '';
+  os.lastKey = '';
+  os.term = { buf: '', pending: '', out: null };
+  os.dice = { side: 1, result: null };
+  os.ai = { shown: false };
   if (on) {
-    t.os.power = true;
-    t.os.bootedAt = Date.now();
+    os.bootedAt = Date.now();
     osDraw(t, osLine(t));
     noteAction(t, 'OS on');
   } else {
@@ -854,22 +916,37 @@ function menuKey(t, key) {
     os.app = APPS[os.cursor].id;
     if (os.app === 'term') os.term = { buf: '', pending: '', out: null };
     if (os.app === 'dice') os.dice.result = rollDie(os);
+    if (os.app === 'ai') {
+      os.ai = { shown: false };
+      clearHistory(t); // fresh conversation each time you enter the AI app
+    }
   }
 }
 
 function appKey(t, key) {
   const os = t.os;
-  if (key === 'select') { os.app = 'menu'; return; }
+  if (key === 'select') {
+    if (os.app === 'ai') abandonChat(t); // stop any in-flight Groq reply
+    os.app = 'menu';
+    return;
+  }
   if (os.app === 'dice') {
     if (key === 'down') { os.dice.side = (os.dice.side + 1) % DICE_SIDES.length; os.dice.result = null; }
     else if (key === 'up') { os.dice.side = (os.dice.side - 1 + DICE_SIDES.length) % DICE_SIDES.length; os.dice.result = null; }
     else if (key === 'fn1') os.dice.result = rollDie(os);
   }
   // clock: nothing to do, the line is rebuilt after every key
+  // ai: ignore other keys; keep the answer on screen
 }
 
 // One key press, from a pin or from the web page's test buttons.
 function osKey(t, key) {
+  const now = Date.now();
+  const last = (t.os.debounce && t.os.debounce[key]) || 0;
+  if (now - last < OS_DEBOUNCE_MS) return;   // debounce: ignore bounce / double-fire
+  if (!t.os.debounce) t.os.debounce = {};
+  t.os.debounce[key] = now;
+
   if (key === 'power') { osPower(t, !t.os.power); return; }
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return; }
 
@@ -962,9 +1039,33 @@ app.post('/api/prompt', (req, res) => {
 app.post('/api/chat', async (req, res) => {
   const t = req.transmitter;
   if (!requireKey(res)) return;
+
   if (t.mode === 'os') {
-    return res.status(409).json({ error: 'This transmitter is in OS mode. Switch it to AI mode in section 5 to chat.' });
+    // OS mode: only works while the "ai chat" app is open on the panel.
+    if (!t.os.power) {
+      return res.status(409).json({ error: 'The OS is off. Turn it on first (pin 1 / the On/off button).' });
+    }
+    if (t.os.app !== 'ai') {
+      return res.status(409).json({ error: 'Open the "ai chat" app first: menu → ai chat → select.' });
+    }
+    if (t.chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
+
+    const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
+    if (!message) return res.status(400).json({ error: 'Type a message first.' });
+
+    let result;
+    try {
+      result = await runOsChat(t, message);
+    } catch (e) {
+      return res.status(502).json({ error: e.message });
+    }
+    if (result.interrupted) {
+      return res.json({ reply: '(interrupted)', interrupted: true, queued: t.queue.length, memory: t.history.length / 2 });
+    }
+    return res.json({ reply: result.reply, queued: t.queue.length, memory: t.history.length / 2 });
   }
+
+  // AI mode.
   if (t.chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
 
   const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
@@ -1093,7 +1194,7 @@ app.get('/api/status', (req, res) => {
   res.json({
     key: !!groqKey,
     mode: t.mode,
-    os: { power: t.os.power, app: t.os.app, screen: t.os.screen, lastKey: t.os.lastKey },
+    os: { power: t.os.power, app: t.os.app, screen: t.os.screen, lastKey: t.os.lastKey, aiShown: t.os.ai.shown },
     model: GROQ_MODEL,
     prompt: t.customPrompt !== null ? 'custom' : 'default',
     memory: t.history.length / 2,
@@ -1168,20 +1269,21 @@ const PAGE = `<!doctype html>
 </section>
 
 <section id="keysec" class="locked">
-  <h2>2. Groq API key (AI mode only)</h2>
+  <h2>2. Groq API key (AI mode + ai chat)</h2>
   <input id="key" type="password" placeholder="gsk_..." autocomplete="off">
   <button onclick="saveKey()">Save key</button>
   <button class="gray" onclick="forgetKey()">Forget key</button>
-  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. The AI features need it; the simulated OS does not.</small>
+  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. Needed by AI mode and by the OS "ai chat" app. The rest of the simulated OS does not need it.</small>
   <div class="st" id="keyst">not connected</div>
 </section>
 
 <section id="chatsec" class="locked">
-  <h2>3. Message (AI mode)</h2>
+  <h2>3. Message</h2>
   <input id="msg" type="text" placeholder="Say something..." autocomplete="off">
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
-  <small>The panel shows your message first, then the reply under it. It remembers the last few messages of THIS transmitter.</small>
+  <small><b>AI mode:</b> the panel shows your message first, then the reply.<br>
+  <b>OS mode:</b> open the <b>ai chat</b> app on the panel first (menu → ai chat → select), then send from here.</small>
   <div class="st" id="reply"></div>
 </section>
 
@@ -1199,7 +1301,7 @@ const PAGE = `<!doctype html>
   <h2>5. Simulated OS (same password)</h2>
   <div class="st" id="osmode">mode: AI text sender</div>
   <button id="osmodebtn" onclick="toggleOsMode()">Switch to OS mode</button>
-  <small>In OS mode the pins the game POSTs are keys: 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The panel shows one line. The AI chat is paused until you switch back.</small>
+  <small>In OS mode the pins the game POSTs are keys: 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The panel shows one line (the ai chat app can use more rows). The AI chat is paused until you switch back.</small>
   <pre class="screen" id="osscreen">(AI mode)</pre>
   <div class="keys">
     <button onclick="osKey('power')">On/off (1)</button>
@@ -1211,7 +1313,7 @@ const PAGE = `<!doctype html>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
-  <small>Menu: up/down pick an app, select opens it. terminal: FN1 scrolls a letter, up accepts it, FN2 = space, select = back, down = run (try: help). clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die.</small>
+  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: FN1 scrolls a letter, up accepts it, FN2 = space, select = back, down = run (try: help). clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
 </section>
 
 <details>
@@ -1316,7 +1418,7 @@ const PAGE = `<!doctype html>
     keySet = !!on;
     var box = document.getElementById('keyst');
     box.textContent = !passSet ? 'not connected (enter a password first)'
-      : (keySet ? 'Key set - the AI is unlocked.' : 'No key set - AI mode is locked (the OS still works).');
+      : (keySet ? 'Key set - the AI is unlocked.' : 'No key set - AI mode and ai chat are locked (the rest of the OS still works).');
     box.className = 'st ' + (keySet && passSet ? 'ok' : 'bad');
     applyGates();
   }
@@ -1594,6 +1696,6 @@ app.listen(PORT, () => {
   console.log('  Each different pass value is a separate panel with its own queue.');
   console.log('  The page itself is open. Type the same password into it to control that panel.');
   console.log('  Simulated OS: switch a panel to OS mode in section 5 of the page.');
-  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page (AI mode only; the OS does not need it).');
+  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page (AI mode + ai chat only; the rest of the OS does not need it).');
   console.log(INITIAL_PROMPT !== null ? 'New transmitters start with the PANEL_PROMPT prompt.' : 'New transmitters start with the default prompt (change it per panel on the page).');
 });

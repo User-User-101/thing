@@ -11,7 +11,7 @@
 // only, like the key, so it is forgotten when the server restarts.
 //
 // You can set your own AI prompt (system prompt) on the web page, under
-// "3. AI prompt". It is also kept in memory only. To start with a custom prompt,
+// "4. AI prompt". It is also kept in memory only. To start with a custom prompt,
 // use PANEL_PROMPT="You are a pirate..." node panel-text.js
 //
 // Setup:
@@ -23,12 +23,14 @@
 // Web page (your browser):  https://YOUR-TUNNEL-URL/
 // Transmitter Url:          https://YOUR-TUNNEL-URL/out
 //
-// ACCESS: the page itself is open, but nothing on it works until you type the panel
-// password into it. Every /api call must carry that password in the X-Panel-Password
-// header, and the in-game HTTP Transmitter must send the same header when it polls
-// /out. So put a custom header on the transmitter:  X-Panel-Password: hi10h
-// (change the name with PASSWORD_HEADER=..., change the value with PANEL_PASSWORD=...).
-// The page remembers the password for the browser tab only.
+// ACCESS: the page itself is open. Under "1. Transmitter access" you choose the
+// shared password and the header name, and the page shows the headers DICTIONARY
+// to paste into the in-game HTTP Transmitter, e.g.
+//   {"x-panel-password":"hi10h"}
+// Every /api call from the page sends that same header, and the transmitter must
+// send it too when it polls /out. The password and header name are kept in the
+// server's memory (change them any time from the page). Start the server with
+// PANEL_PASSWORD=... / PASSWORD_HEADER=... to seed them instead.
 // /out also accepts ?token=secret when the server is started with OUT_TOKEN=secret,
 // for transmitters that cannot send headers.
 //
@@ -58,21 +60,27 @@ const app = express();
 
 // ======================= ACCESS CONTROL =======================
 
-// The shared secret. The page is open, but every /api call has to send this password
-// in the PASSWORD_HEADER header, and so does the in-game HTTP Transmitter when it
-// polls /out. You type it into the page once; the page keeps it for that tab.
-const PASSWORD = String(process.env.PANEL_PASSWORD || 'hi10h').trim();
+// The shared secret and the header that carries it. Both can be changed at runtime
+// from the page ("1. Transmitter access"). The in-game HTTP Transmitter must send
+// the same header name/value; the page shows the exact dictionary to paste there.
+const DEFAULT_PASSWORD = String(process.env.PANEL_PASSWORD || 'hi10h').trim();
+let PANEL_PASS = DEFAULT_PASSWORD;
 
-// Name of the header that carries the password. HTTP header names are
-// case-insensitive, so "X-Panel-Password: hi10h" on the transmitter is enough.
-// Set PASSWORD_HEADER=... to use a different name.
-const PASSWORD_HEADER = String(process.env.PASSWORD_HEADER || 'x-panel-password')
-  .trim().toLowerCase().replace(/[^a-z0-9-]/g, '') || 'x-panel-password';
+// HTTP header names are case-insensitive, so "X-Panel-Password" from the game
+// arrives here as "x-panel-password".
+function cleanHeaderName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '');
+}
+
+let PASSWORD_HEADER = cleanHeaderName(process.env.PASSWORD_HEADER || 'x-panel-password') || 'x-panel-password';
 
 // Optional: /out also accepts ?token=... , for transmitters that cannot send headers.
 const OUT_TOKEN = String(process.env.OUT_TOKEN || '').trim();
 
-if (!PASSWORD) {
+if (!DEFAULT_PASSWORD) {
   console.error('Refusing to start without a password.');
   console.error('Start it like this instead:');
   console.error('  PANEL_PASSWORD=something-secret node panel-text.js');
@@ -86,18 +94,24 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-// The password the request sent in its header ('' when there is none).
-function givenPassword(req) {
+// True when the request carries the right password in the configured header.
+function hasPassword(req) {
   const v = req.headers[PASSWORD_HEADER];
-  if (Array.isArray(v)) return String(v[0] || '');
-  return v === undefined || v === null ? '' : String(v);
+  const given = Array.isArray(v) ? String(v[0] || '') : (v === undefined || v === null ? '' : String(v));
+  if (!given) return false;
+  return safeEqual(given, PANEL_PASS);
 }
 
-// True when the request carries the right password header.
-function hasPassword(req) {
-  const given = givenPassword(req);
-  if (!given) return false;
-  return safeEqual(given, PASSWORD);
+// What the page and the game need to agree on: the header name, the password,
+// and the headers dictionary the transmitter expects.
+function accessInfo() {
+  const dictionary = JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS });
+  return {
+    header: PASSWORD_HEADER,
+    password: PANEL_PASS,
+    dictionary,
+    outToken: !!OUT_TOKEN,
+  };
 }
 
 // Never let Express, a tunnel or the game cache /out: most frames are the same few
@@ -115,7 +129,7 @@ app.use('/out', express.text({ type: () => true }));
 app.use(express.json());
 
 // Everything under /api needs the password header. The page itself (/) is public,
-// but it cannot do anything until you type the password into it.
+// but it cannot do anything until you enter the password on it.
 app.use('/api', (req, res, next) => {
   if (hasPassword(req)) return next();
   return res.status(403).json({
@@ -688,6 +702,42 @@ async function askGroq(message, hist = history) {
 
 const n = (v, max) => Math.max(0, Math.min(max, Number(v) | 0));
 
+// Read the access settings (header name, password, and the exact headers dictionary
+// to paste into the game's HTTP Transmitter). The page is already password-gated.
+app.get('/api/access', (_req, res) => {
+  res.json(accessInfo());
+});
+
+// Change the password and/or the header name. The page calls this after you edit
+// the fields under "1. Transmitter access". The game's transmitter keeps using the
+// old value until you paste the new dictionary into it.
+app.post('/api/access', (req, res) => {
+  const password = String(req.body.password === undefined ? '' : req.body.password).trim();
+  const header = cleanHeaderName(req.body.header || PASSWORD_HEADER);
+
+  if (!header) {
+    return res.status(400).json({ error: 'Header name must contain at least one letter or digit.' });
+  }
+  if (header === 'host' || header === 'content-length' || header === 'connection') {
+    return res.status(400).json({ error: 'That header name is reserved by HTTP.' });
+  }
+  if (!password) {
+    return res.status(400).json({ error: 'Password cannot be empty.' });
+  }
+  if (password.length > 200) {
+    return res.status(400).json({ error: 'Password too long (max 200 characters).' });
+  }
+
+  PANEL_PASS = password;
+  PASSWORD_HEADER = header;
+
+  res.json({
+    ok: true,
+    ...accessInfo(),
+    message: 'Saved. Put the headers dictionary into the game transmitter.',
+  });
+});
+
 // Set / clear the Groq key. A non-empty key is checked against api.groq.com first,
 // so a typo is caught immediately instead of silently breaking every send.
 app.post('/api/key', async (req, res) => {
@@ -915,6 +965,7 @@ app.get('/api/status', (_req, res) => {
     glyph: held !== null ? 'HELD (test)' : last.clear ? 'CLEAR SCREEN' : glyph(last.code),
     auth: {
       header: PASSWORD_HEADER,
+      dictionary: JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS }),
       transmitterRejected: outRejected,
       transmitterLastOk: outLastOk,
     },
@@ -936,6 +987,7 @@ const PAGE = `<!doctype html>
   input[type=number] { width:4.5rem; }
   input[type=checkbox] { width:auto; margin:.2rem .4rem .2rem 0; vertical-align:middle; }
   textarea { width:calc(100% - .4rem); box-sizing:border-box; min-height:7rem; resize:vertical; font-family:inherit; background:#fff; color:#111; }
+  textarea.dict { min-height:3.2rem; font-family:monospace; font-size:.95rem; }
   button { background:#2d6cdf; color:#fff; cursor:pointer; }
   button.gray { background:#444; }
   button:disabled { background:#2a2a2a; color:#666; cursor:not-allowed; }
@@ -952,11 +1004,20 @@ const PAGE = `<!doctype html>
 <h1>Panel Text</h1>
 
 <section id="passsec" class="locked">
-  <h2>1. Panel password</h2>
-  <input id="pass" type="password" placeholder="Panel password" autocomplete="off">
-  <button onclick="unlock()">Unlock</button>
+  <h2>1. Transmitter access</h2>
+  <label class="wrap">Password
+    <input id="pass" type="password" placeholder="shared password" autocomplete="off">
+  </label>
+  <label class="wrap">Header name
+    <input id="hdr" type="text" value="${PASSWORD_HEADER}" autocomplete="off">
+  </label>
+  <button id="unlockbtn" onclick="unlockOrSave()">Unlock</button>
+  <button class="gray" onclick="genPass()">Generate</button>
   <button class="gray" onclick="lockPage()">Lock</button>
-  <small>This is the password your in-game HTTP Transmitter sends in the <b>${PASSWORD_HEADER}</b> header. The page itself is open, but nothing here works until you type it. It is remembered for this browser tab only.</small>
+  <small>Your in-game HTTP Transmitter must send this header with this password. Its headers field takes a <b>dictionary</b>, so paste the one below into the game.</small>
+  <div class="st">Transmitter headers dictionary:</div>
+  <textarea id="dict" class="dict" readonly spellcheck="false"></textarea>
+  <button class="gray" onclick="copyDict()">Copy dictionary</button>
   <div class="st" id="passst">locked</div>
 </section>
 
@@ -1051,11 +1112,15 @@ const PAGE = `<!doctype html>
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
   function storedPass() { try { return sessionStorage.getItem('panelPass') || ''; } catch (e) { return ''; } }
-  function setStoredPass(p) {
-    try { if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass'); } catch (e) {}
+  function storedHeader() { try { return sessionStorage.getItem('panelHeader') || ''; } catch (e) { return ''; } }
+  function setStored(p, h) {
+    try {
+      if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass');
+      if (h) sessionStorage.setItem('panelHeader', h); else sessionStorage.removeItem('panelHeader');
+    } catch (e) {}
   }
 
-  // Headers for every request: the JSON bits plus the panel password.
+  // Headers for every request: the JSON bits plus the panel password in its header.
   function passHeaders() {
     var h = {};
     for (var k in H) h[k] = H[k];
@@ -1063,13 +1128,14 @@ const PAGE = `<!doctype html>
     return h;
   }
 
-  async function post(path, body) {
-    var r = await fetch(path, { method: 'POST', headers: passHeaders(), body: JSON.stringify(body || {}) });
-    var j = {};
-    try { j = await r.json(); } catch (e) {}
-    if (r.status === 403 && j && j.locked) onLocked();
-    refresh();
-    return j;
+  function dictFor(header, password) {
+    var d = {};
+    d[header] = password;
+    return JSON.stringify(d);
+  }
+
+  function renderDict(header, password) {
+    document.getElementById('dict').value = dictFor(header, password);
   }
 
   // Enable/disable everything from the two gates: password entered, key set.
@@ -1077,10 +1143,11 @@ const PAGE = `<!doctype html>
     var btns = document.querySelectorAll('button');
     for (var i = 0; i < btns.length; i++) {
       var b = btns[i];
-      if (b.closest('#passsec')) continue; // Unlock / Lock always usable
+      if (b.closest('#passsec')) continue; // Unlock / Generate / Lock / Copy always usable
       var needKey = b.classList.contains('needs-key');
       b.disabled = !passSet || (needKey && !keySet);
     }
+    document.getElementById('unlockbtn').textContent = passSet ? 'Save changes' : 'Unlock';
     document.getElementById('keysec').className = (passSet && keySet) ? '' : 'locked';
     document.getElementById('chatsec').className = passSet ? '' : 'locked';
     document.getElementById('promptsec').className = passSet ? '' : 'locked';
@@ -1098,9 +1165,11 @@ const PAGE = `<!doctype html>
 
   function onLocked() {
     pass = '';
-    setStoredPass('');
     passSet = false;
     keySet = false;
+    setStored('', '');
+    document.getElementById('pass').value = '';
+    document.getElementById('dict').value = '';
     applyGates();
     var box = document.getElementById('passst');
     box.textContent = 'locked - enter the panel password';
@@ -1113,25 +1182,81 @@ const PAGE = `<!doctype html>
     }
   }
 
-  async function unlock() {
-    var el = document.getElementById('pass');
-    var box = document.getElementById('passst');
-    var p = el.value;
-    if (!p) { box.textContent = 'type the password'; box.className = 'st bad'; return; }
-    box.textContent = 'checking...';
-    box.className = 'st';
-    var h = {};
-    for (var k in H) h[k] = H[k];
-    h[PASS_HEADER] = p;
+  function showAccessInputs(j) {
+    document.getElementById('pass').value = j.password;
+    document.getElementById('hdr').value = j.header;
+    renderDict(j.header, j.password);
+  }
+
+  // After unlocking, pull the server's current header/password so the page and the
+  // game's dictionary always show the same thing.
+  async function syncAccess() {
     try {
-      var r = await fetch('/api/status', { headers: h });
-      if (r.status === 403) { box.textContent = 'wrong password'; box.className = 'st bad'; return; }
-      if (!r.ok) { box.textContent = 'error ' + r.status; box.className = 'st bad'; return; }
-      pass = p;
-      setStoredPass(p);
+      var r = await fetch('/api/access', { headers: passHeaders() });
+      if (!r.ok) return;
+      var j = await r.json();
+      pass = j.password;
+      PASS_HEADER = j.header;
+      setStored(pass, PASS_HEADER);
+      showAccessInputs(j);
+    } catch (e) {}
+  }
+
+  // One button: Unlock when locked, Save changes when unlocked.
+  async function unlockOrSave() {
+    var pEl = document.getElementById('pass');
+    var hEl = document.getElementById('hdr');
+    var box = document.getElementById('passst');
+    var p = pEl.value.trim();
+    var h = (hEl.value.trim() || 'x-panel-password').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'x-panel-password';
+
+    if (!p) { box.textContent = 'type a password'; box.className = 'st bad'; return; }
+
+    if (!passSet) {
+      box.textContent = 'checking...';
+      box.className = 'st';
+      var headers = {};
+      for (var k in H) headers[k] = H[k];
+      headers[h] = p;
+      try {
+        var r = await fetch('/api/status', { headers: headers });
+        if (r.status === 403) { box.textContent = 'wrong password (or header name)'; box.className = 'st bad'; return; }
+        if (!r.ok) { box.textContent = 'error ' + r.status; box.className = 'st bad'; return; }
+        pass = p;
+        PASS_HEADER = h;
+        passSet = true;
+        setStored(p, h);
+        await syncAccess();
+        box.textContent = 'unlocked';
+        box.className = 'st ok';
+        applyGates();
+        refresh();
+        loadPrompt();
+      } catch (e) {
+        box.textContent = 'error: ' + e.message;
+        box.className = 'st bad';
+      }
+      return;
+    }
+
+    // Already unlocked: save the edited password / header name on the server.
+    box.textContent = 'saving...';
+    box.className = 'st';
+    try {
+      var r2 = await fetch('/api/access', {
+        method: 'POST',
+        headers: passHeaders(),
+        body: JSON.stringify({ password: p, header: h }),
+      });
+      var j = await r2.json();
+      if (r2.status === 403 && j.locked) { onLocked(); return; }
+      if (!r2.ok) { box.textContent = j.error || 'could not save'; box.className = 'st bad'; return; }
+      pass = j.password;
+      PASS_HEADER = j.header;
       passSet = true;
-      el.value = '';
-      box.textContent = 'unlocked';
+      setStored(pass, PASS_HEADER);
+      showAccessInputs(j);
+      box.textContent = 'saved - paste the dictionary above into the game';
       box.className = 'st ok';
       applyGates();
       refresh();
@@ -1141,7 +1266,37 @@ const PAGE = `<!doctype html>
     }
   }
 
+  function genPass() {
+    var chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    var s = '';
+    for (var i = 0; i < 16; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+    document.getElementById('pass').value = s;
+    document.getElementById('passst').textContent = 'generated - click ' + (passSet ? 'Save changes' : 'Unlock');
+    document.getElementById('passst').className = 'st';
+  }
+
+  function copyDict() {
+    var el = document.getElementById('dict');
+    if (!el.value) return;
+    el.select();
+    el.setSelectionRange(0, el.value.length);
+    try { navigator.clipboard.writeText(el.value); } catch (e) {}
+    try { document.execCommand('copy'); } catch (e) {}
+    var box = document.getElementById('passst');
+    box.textContent = 'dictionary copied';
+    box.className = 'st ok';
+  }
+
   function lockPage() { onLocked(); }
+
+  async function post(path, body) {
+    var r = await fetch(path, { method: 'POST', headers: passHeaders(), body: JSON.stringify(body || {}) });
+    var j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (r.status === 403 && j && j.locked) onLocked();
+    refresh();
+    return j;
+  }
 
   async function saveKey() {
     var el = document.getElementById('key');
@@ -1175,7 +1330,7 @@ const PAGE = `<!doctype html>
   }
 
   // ---- AI prompt ----
-  // Loaded once on page load (not on the 0.5 s refresh) so it never overwrites
+  // Loaded after unlock (not on the 0.5 s refresh) so it never overwrites
   // what you are typing.
   async function loadPrompt() {
     if (!passSet) return;
@@ -1271,7 +1426,7 @@ const PAGE = `<!doctype html>
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
       document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' (pin 1 = interrupt, pin 2 = redo) | last action: ' + (s.action || 'none');
       var ago = s.auth.transmitterLastOk === null ? 'never' : Math.round((Date.now() - s.auth.transmitterLastOk) / 1000) + ' s ago';
-      document.getElementById('st9').textContent = 'transmitter: header ' + s.auth.header + ' | last good poll: ' + ago + ' | rejected polls: ' + s.auth.transmitterRejected;
+      document.getElementById('st9').textContent = 'transmitter headers: ' + s.auth.dictionary + ' | last good poll: ' + ago + ' | rejected polls: ' + s.auth.transmitterRejected;
     } catch (e) {}
   }
 
@@ -1279,23 +1434,32 @@ const PAGE = `<!doctype html>
     if (e.key === 'Enter') sendMsg();
   });
   document.getElementById('pass').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') unlock();
+    if (e.key === 'Enter') unlockOrSave();
   });
 
+  // Restore the password/header from this tab, if any. If the server no longer
+  // accepts it, the first refresh locks the page again.
   pass = storedPass();
+  PASS_HEADER = storedHeader() || PASS_HEADER;
   passSet = !!pass;
+  document.getElementById('hdr').value = PASS_HEADER;
   applyGates();
-  loadPrompt();
-  refresh();
+  if (passSet) {
+    renderDict(PASS_HEADER, pass);
+    syncAccess().then(function () { loadPrompt(); refresh(); });
+  }
   setInterval(refresh, 500);
 </script>`;
 
 app.get('/', (_req, res) => res.send(PAGE));
 
 app.listen(PORT, () => {
+  const dict = JSON.stringify({ [PASSWORD_HEADER]: PANEL_PASS });
   console.log('Panel page: http://localhost:' + PORT + '/ (open, but needs the panel password)');
-  console.log('Game transmitter path: /out (send header ' + PASSWORD_HEADER + ': <password>' + (OUT_TOKEN ? ', or ?token=...' : '') + ')');
-  console.log('Panel password: ' + (process.env.PANEL_PASSWORD ? 'from PANEL_PASSWORD.' : 'default "hi10h" - set PANEL_PASSWORD to change it.'));
+  console.log('Game transmitter path: /out');
+  console.log('  Transmitter headers dictionary: ' + dict);
+  console.log('  (send that as the HTTP Transmitter headers' + (OUT_TOKEN ? ', or use ?token=...' : '') + ')');
+  console.log('Password source: ' + (process.env.PANEL_PASSWORD ? 'PANEL_PASSWORD env var (changeable on the page).' : 'default "hi10h" (change it on the page or with PANEL_PASSWORD).'));
   console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY.' : 'No Groq key yet - set one on the page.');
   console.log(customPrompt !== null ? 'Custom prompt loaded from PANEL_PROMPT.' : 'Using the default prompt (change it on the page).');
 });

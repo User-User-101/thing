@@ -1,14 +1,28 @@
-// Groq-powered text sender for Build Logic's 16x16 RGB panel
+// Groq-powered text sender + simulated OS for Build Logic's 16x16 RGB panel
 //
-// You type a message on the web page; the server asks a Groq-hosted model for a
-// SHORT reply, turns each character into its 7-bit code (shift + 6 character pins)
-// and feeds it to ONE HTTP Transmitter, one frame per poll. The panel shows YOUR
-// message first, then the reply underneath it. Everything else (cursor, clock,
-// reset, colors) you build in-game.
+// TWO MODES per transmitter (switch on the web page, section "5. Simulated OS"):
 //
-// The conversation is remembered server-side (the last MAX_HISTORY_TURNS exchanges),
-// so follow-up messages can refer back to earlier ones. Memory lives in this process
-// only, like the key, so it is forgotten when the server restarts.
+//   AI mode (default): you type a message on the web page; the server asks a Groq-hosted
+//   model for a SHORT reply, turns each character into its 7-bit code (shift + 6
+//   character pins) and feeds it to ONE HTTP Transmitter, one frame per poll. The panel
+//   shows YOUR message first, then the reply underneath it.
+//
+//   OS mode: a SIMULATED operating system (nothing real runs, it all happens in this
+//   script). The pins the transmitter POSTs are the keys of the machine:
+//        pin 1 = POWER   (on / off)
+//        pin 2 = DOWN
+//        pin 3 = UP
+//        pin 4 = SELECT  (open / go back)
+//        pin 5 = FN1
+//        pin 6 = FN2
+//   Each key fires once on its rising edge (0 -> 1). The OS draws its screen with the
+//   same character output as AI mode (clear + characters), so no extra wiring is needed.
+//   Apps: term (command processor), clok (clock), dice, info. See the SIMULATED OS
+//   section below for how each key behaves in each app.
+//
+// The conversation (AI mode) is remembered server-side (the last MAX_HISTORY_TURNS
+// exchanges). Memory lives in this process only, like the key, so it is forgotten when
+// the server restarts. The OS state is also in memory only.
 //
 // You can set your own AI prompt (system prompt) on the web page, under
 // "4. AI prompt". It is kept per transmitter, in memory only. To start every new
@@ -23,9 +37,9 @@
 // Web page (your browser):  https://YOUR-TUNNEL-URL/
 // Transmitter Url:          https://YOUR-TUNNEL-URL/out
 //
-// ACCESS: there is no server-wide password any more. Instead, every request carries
-// a "pass" header, and the value of that header identifies ONE transmitter (panel).
-// In Build Logic, add this HTTP header to your HTTP Transmitter:
+// ACCESS: there is no server-wide password. Instead, every request carries a "pass"
+// header, and the value of that header identifies ONE transmitter (panel). In Build
+// Logic, add this HTTP header to your HTTP Transmitter:
 //
 //     pass: my-secret-password
 //
@@ -33,29 +47,26 @@
 //
 //     {"pass":"my-secret-password"}
 //
-// On the web page, type the SAME password under "1. Connect to a transmitter".
-// That is the only password you need. The page itself is open; the password is what
-// pairs it with your in-game transmitter. Any password works: type a new one and the
-// server creates a new transmitter (a new empty panel); type an existing one and you
-// are back on that panel, with its queue, history and prompt intact.
+// On the web page, type the SAME password under "1. Connect to a transmitter". The OS
+// uses that same password: it is just another section of the page for the same
+// transmitter. Any password works: type a new one and the server creates a new
+// transmitter (a new empty panel); type an existing one and you are back on that panel.
 //
 // MULTIPLE TRANSMITTERS: every different password is a separate panel. Each has its
-// own frame queue, conversation, prompt, and diagnostics. So you can drive several
-// in-game panels from the same server by giving each transmitter a different "pass"
-// value, and controlling one at a time from the page (or one tab per panel).
+// own frame queue, conversation, prompt, OS state and diagnostics.
 //
 // HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
 //   {"value":"00000000"}
 // (with the pass header) and the server answers with the next panel frame, also as
 //   {"value":"........"}.
-// The FIRST characters of what you POST are control pins (first pin = leftmost):
-//   pin 1 = INTERRUPT: stop the response that is being drawn (or still being thought up)
-//   pin 2 = REDO:      ask the AI again for the last message and draw the new answer
-// Both act once on the rising edge (0 -> 1), so holding a pin high does not repeat.
-// The other 6 pins are ignored. GET /out also works, with the pass header (no controls).
+// The FIRST characters of what you POST are the input pins (first pin = leftmost).
+//   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
+//   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
+// All of them act once on the rising edge (0 -> 1), so holding a pin high does not
+// repeat. Pins that are not used are ignored. GET /out also works (no inputs).
 //
-// The Groq API key is REQUIRED and is shared by all transmitters on this server.
-// Nothing is sent to a panel until a key is set and verified against api.groq.com.
+// The Groq API key is REQUIRED for AI mode and is shared by all transmitters on this
+// server. The simulated OS does NOT need a key.
 //
 // Output is an 8-bit string, leftmost bit first:
 //   X S C5 C4 C3 C2 C1 C0
@@ -70,29 +81,20 @@ const app = express();
 
 // ======================= ACCESS CONTROL =======================
 
-// The header every request must carry. The value is the password that identifies
-// one transmitter. HTTP header names are case-insensitive, so the game sending
-// "Pass: my-secret-password" arrives here as "pass".
 const PASS_HEADER = 'pass';
-
-// A password is used as a Map key and sent as a header, so keep it sane.
 const MAX_PASSWORD_CHARS = 200;
 
-// Never let Express, a tunnel or the game cache /out: most frames are the same few
-// values, and a cached or 304 reply would hand the game stale data.
+// Never let Express, a tunnel or the game cache /out.
 app.disable('etag');
 app.use((req, res, next) => {
   if (req.path === '/out') res.set('Cache-Control', 'no-store');
   next();
 });
 
-// The game's transmitter may not label its POST body as JSON, so /out reads the body
-// as raw text whatever the Content-Type is, and parses it itself (see readInputBits).
-// This must come before express.json(), which then skips the already-read body.
+// /out reads the body as raw text whatever the Content-Type is (see readInputBits).
 app.use('/out', express.text({ type: () => true }));
 app.use(express.json());
 
-// Read the password header from a request. Empty string means "none given".
 function givenPassword(req) {
   const v = req.headers[PASS_HEADER];
   const raw = Array.isArray(v) ? String(v[0] || '') : (v === undefined || v === null ? '' : String(v));
@@ -103,46 +105,18 @@ const PORT = 3000;
 
 // ======================= SETTINGS =======================
 
-// Which clock circuit you have in the game. There is no strobe bit: the 7 code bits are
-// OR'd together, and "any code bit on" is what triggers a write. Code 0000000 means
-// "nothing" and is what the pins sit at when idle.
-//
-//   'pulse-fast' / 'pulse-safe' (simple circuit): the 7 code pins go into an 8-input OR
-//           whose output goes straight to the panel's clock and set enabled. The clock
-//           therefore rises each time the code goes from 0 to non-zero, and the panel
-//           writes one character per rising edge, however long the code stays on the
-//           pins. A code-0 gap is needed between every pair of characters so the clock
-//           can fall and rise again.
-//   'loop'  (the original): AND output -> NOT -> 0.01 s delay -> back into the AND.
-//           That is a free-running clock, so it keeps writing while a code is on the
-//           pins and cannot be made reliable at a 0.1 s poll. Frames are sent once.
-//
-// Per preset: CHAR_FRAMES = polls each character is held; GAP = where code-0 frames go
-// ('always' between every pair, 'repeats' only between identical letters); GAP_FRAMES =
-// how many code-0 polls make up a gap. Lower the numbers for speed, raise them for safety.
-//
-// With the 'pulse' circuit pick a speed:
-//   'pulse-fast' 2 polls per character (0.2 s at a 0.1 s interval = 5 letters/second).
-//                A lost poll can lose a letter.
-//   'pulse-safe' 4 polls per character (2.5 letters/second). Survives one lost poll.
-//
-// With the 'change' circuit (every code bit compared with a delayed copy of itself, so
-// the clock fires on ANY change of the code to a non-zero value) no gap is needed
-// between different letters, only between identical ones:
-//   'change'      1 poll per character (10 letters/second at 0.1 s). A lost poll can
-//                 lose a letter.
-//   'change-safe' each character held 2 polls (5 letters/second). Survives one lost poll.
+// Which clock circuit you have in the game (see the preset table below).
+//   'pulse-fast' / 'pulse-safe' (simple circuit): code-0 gap needed between every pair
+//           of characters. 'pulse-fast' = 2 polls per character, 'pulse-safe' = 4.
+//   'loop'  (the original free-running clock). Frames are sent once.
+//   'change' / 'change-safe': gap only needed between identical letters.
 const CIRCUIT = 'pulse-fast';
-// CLEAR_WAIT is no longer used by clearFrames(); see CLEAR_HOLD / CLEAR_SETTLE below.
 const PRESETS = {
   'pulse-fast': { CHAR_FRAMES: 1, GAP: 'always', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
   'pulse-safe': { CHAR_FRAMES: 3, GAP: 'always', GAP_FRAMES: 3, CLEAR_WAIT: 1 },
   change: { CHAR_FRAMES: 1, GAP: 'repeats', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
   'change-safe': { CHAR_FRAMES: 2, GAP: 'repeats', GAP_FRAMES: 2, CLEAR_WAIT: 1 },
   loop: { CHAR_FRAMES: 1, GAP: 'repeats', GAP_FRAMES: 1, CLEAR_WAIT: 1 },
-  // EXPERIMENT: no gaps at all and no wait after the clear, one poll per character.
-  // With the simple circuit the clock never falls between letters, so expect only the
-  // first letter to be written. Set CIRCUIT back to 'pulse-fast' afterwards.
   turbo: { CHAR_FRAMES: 1, GAP: 'never', GAP_FRAMES: 0, CLEAR_WAIT: 0 },
 };
 const { CHAR_FRAMES, GAP, GAP_FRAMES } = PRESETS[CIRCUIT];
@@ -155,38 +129,23 @@ const CLEAR_BEFORE_TEXT = true;
 const CLEAR_HOLD = 1;
 const CLEAR_SETTLE = 1;
 
-// ---- Show the user's message on the panel before the reply ----
+// ---- Show the user's message on the panel before the reply (AI mode) ----
 const SHOW_INPUT = true;
 
-// How many characters fit on ONE row of your panel before it wraps.
-// The character table has no newline, so the script pads the input with spaces
-// up to the next row boundary so the reply starts on a fresh row.
-// 4 is a guess: send "abcdefghijklmnop" from Manual tools, count the letters on
-// the first row, and put that number here.
+// How many characters fit on ONE row of your panel before it wraps. The OS also uses
+// this as its screen width. 4 is a guess: send "abcdefghijklmnop" from Manual tools,
+// count the letters on the first row, and put that number here.
 const CHARS_PER_ROW = 4;
 
 // If your in-game panel has a code that moves the cursor to the next line,
 // put it here (0-127) and padding is skipped. Leave null otherwise.
 const NEWLINE_CODE = null;
 
-// Longest echo of the user's message itself (anything longer is cut at this length).
-// The prefix and suffix below are added on top of this.
 const ECHO_MAX_CHARS = 16;
-
-// The echo is drawn as  PREFIX + message + SUFFIX,  e.g.  (▶hello)
-// Your character table has no ">" so the arrow "▶" (code 61) is used instead.
-// Put a space inside the prefix (like '(▶ ') if you want a gap, at the cost of one cell.
 const ECHO_PREFIX = '(▶';
 const ECHO_SUFFIX = ')';
-
-// null = the reply starts at the beginning of the row directly under the echo.
-// The echo is padded with blank cells up to the next row boundary, which only
-// lines up if CHARS_PER_ROW matches your panel (or NEWLINE_CODE is set).
-// A number = send that many blank cells between echo and reply instead. That
-// distance is fixed, so the reply only sits under the echo by luck.
 const ECHO_GAP = null;
 
-// What goes between the echo and the reply
 function separatorCodes(usedChars) {
   if (ECHO_GAP !== null) return Array(ECHO_GAP).fill(SPACE_CODE);
   return lineBreakCodes(usedChars);
@@ -206,8 +165,7 @@ const SPACE_CODE = 63;
 // Flip if the game reads the 8-bit string in the opposite direction
 const REVERSE_BITS = false;
 
-// ---- Control pins, read from the value the transmitter POSTs to /out ----
-// Position in the posted string, counting from 0 at the leftmost (first) pin.
+// ---- AI-mode control pins, read from the value the transmitter POSTs to /out ----
 const PIN_INTERRUPT = 0;
 const PIN_REDO = 1;
 
@@ -215,47 +173,27 @@ const PIN_REDO = 1;
 const INTERRUPT_CLEARS_SCREEN = false;
 
 // Per-character overrides, as full 7-bit codes (0-127).
-// 'Î' is missing from your table, so it uses the same code as 'Ì'.
 const CUSTOM = { 'Î': 113 };
 
 // ======================= GROQ SETTINGS =======================
 
-// Get a key at https://console.groq.com/keys . It starts with "gsk_".
-// You can also start the server with GROQ_API_KEY=... to pre-fill it.
-// The key is shared by every transmitter on this server.
 let groqKey = String(process.env.GROQ_API_KEY || '').trim();
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
 
-// 'openai/gpt-oss-20b' is Groq's current fast, inexpensive replacement for the
-// retired 'llama-3.1-8b-instant'. It is a reasoning model, so:
-//   - we use max_completion_tokens (not max_tokens)
-//   - we set reasoning_effort: 'low' so it does not burn the whole budget thinking
-//   - the budget is generous: reasoning and visible text share it, and if it runs
-//     out the reply is cut off mid-sentence (finish_reason 'length'), which we detect.
+// Reasoning model: uses max_completion_tokens and reasoning_effort 'low'.
 const GROQ_MODEL = 'openai/gpt-oss-20b';
 
-// Reply length policy. The model is asked to stay under SOFT; between SOFT and HARD
-// is accepted as "a bit long". Above HARD (or a token-limit cut) we ask the model to
-// answer again, shorter but complete. A reply is NEVER cut mid-word.
 const REPLY_SOFT_CHARS = 48;
 const REPLY_HARD_CHARS = 120;
 const COMPLETION_TOKENS = 2048;   // room for hidden reasoning + the visible reply
 const MAX_INPUT_CHARS = 300;      // don't forward huge prompts
 
-// How much of the conversation to remember. Each "turn" is one user message plus
-// one assistant reply. Older turns are dropped once the limit is exceeded.
 const MAX_HISTORY_TURNS = 10;
 
 // ======================= PROMPT (CUSTOMIZABLE) =======================
 
-// The default prompt is made of two parts:
-//   DEFAULT_PERSONA - who the model is and how it behaves. This is the part you
-//                     normally want to replace with your own text.
-//   PANEL_RULES     - the technical limits of the panel (short, one line, only
-//                     characters the panel can draw). Appended after your prompt
-//                     unless you untick "Add the panel rules" on the page.
 const DEFAULT_PERSONA =
   'You write replies for a 16x16 LED matrix panel that can only show a single line. ' +
   'You are continuing a conversation, so use earlier turns when they help. ';
@@ -271,8 +209,6 @@ const PANEL_RULES =
 
 const MAX_PROMPT_CHARS = 2000;
 
-// Every new transmitter starts with this prompt (null = the built-in default persona).
-// Pre-fill it with PANEL_PROMPT="..." when starting the server.
 const INITIAL_PROMPT = String(process.env.PANEL_PROMPT || '').trim().slice(0, MAX_PROMPT_CHARS) || null;
 
 const SHORTEN_PROMPT =
@@ -281,10 +217,7 @@ const SHORTEN_PROMPT =
 
 // ======================= TRANSMITTERS =======================
 //
-// One transmitter per distinct "pass" header value. Everything that used to be
-// per-server (queue, history, prompt, counters) now lives in an object in this
-// Map. Functions that used to read globals take the transmitter as their first
-// parameter.
+// One transmitter per distinct "pass" header value.
 
 const transmitters = new Map(); // password -> transmitter
 const TRANSMITTER_IDLE_MS = 12 * 60 * 60 * 1000; // drop transmitters untouched for 12 h
@@ -303,10 +236,14 @@ function makeTransmitter(password) {
     sentLog: [],                     // characters put on the pins, newest last
     prevSent: { clear: 0, code: 0 },
 
-    // ---- input (control pins) ----
+    // ---- input (pins) ----
     prevIn: null,
     lastIn: null,
     lastAction: '',
+
+    // ---- mode: 'ai' (Groq text sender) or 'os' (simulated OS) ----
+    mode: 'ai',
+    os: makeOS(),
 
     // ---- conversation ----
     history: [],
@@ -327,7 +264,6 @@ function makeTransmitter(password) {
   };
 }
 
-// Return the transmitter for a password, creating an empty one if it is new.
 function getTransmitter(password) {
   let t = transmitters.get(password);
   if (!t) {
@@ -338,8 +274,6 @@ function getTransmitter(password) {
   return t;
 }
 
-// Forget transmitters that no one has touched or polled for a long time, so a
-// typo or a stranger poking at the tunnel does not keep an object forever.
 function pruneTransmitters() {
   const now = Date.now();
   for (const [pass, t] of transmitters) {
@@ -350,9 +284,7 @@ function pruneTransmitters() {
 const pruneTimer = setInterval(pruneTransmitters, 60 * 60 * 1000);
 if (pruneTimer.unref) pruneTimer.unref();
 
-// Every /api call must carry the pass header. The value selects (or creates) the
-// transmitter, which the handler then works on. The page sends the same header
-// it just showed you in the dictionary.
+// Every /api call must carry the pass header.
 app.use('/api', (req, res, next) => {
   const password = givenPassword(req);
   if (!password) {
@@ -398,7 +330,6 @@ function encode(ch) {
   return code !== undefined ? code : LOOKUP.get('?'); // unknown characters become '?'
 }
 
-// What the panel draws for a code, for the page status line
 function glyph(code) {
   if (code === 0) return '(nothing)';
   return CHARS[code] || '(blank)';
@@ -415,15 +346,13 @@ const toValue = (f) => bin8((f.clear << 7) | (f.code & 127));
 const blank = () => ({ clear: 0, code: 0 });
 const times = (f, count) => Array.from({ length: count }, () => ({ ...f }));
 
-// The clear frame is held CLEAR_HOLD polls, then CLEAR_SETTLE code-0 polls follow
-// so the reset has time to finish before the first letter arrives.
 function clearFrames() {
   return [...times({ clear: 1, code: 0 }, CLEAR_HOLD), ...times(blank(), CLEAR_SETTLE)];
 }
 
-// Each character is held for CHAR_FRAMES polls, with a code-0 gap (GAP_FRAMES polls)
-// where the preset asks for one (see CIRCUIT). Reads t.queue / t.last so a gap is
-// inserted correctly when frames are appended to an already non-empty queue.
+// Each character is held for CHAR_FRAMES polls, with a code-0 gap where the preset asks
+// for one. Reads t.queue / t.last so a gap is inserted correctly when frames are
+// appended to an already non-empty queue.
 function buildFrames(t, codes) {
   const out = [];
   let prev = t.queue.length ? t.queue[t.queue.length - 1].code : t.last.code;
@@ -464,7 +393,6 @@ function pollStats(t) {
 }
 
 // ---- Sent log: the characters the server actually put on the pins, newest last ----
-// Compare this with what the panel drew. [CLR] = clear frame, · = blank cell.
 function noteSent(t, frame) {
   if (frame.clear && !t.prevSent.clear) {
     t.sentLog.push('[CLR]');
@@ -475,11 +403,10 @@ function noteSent(t, frame) {
   t.prevSent = frame;
 }
 
-// ---- Control pins (INTERRUPT / REDO) ----
+// ---- Input pins ----
 
 // Pull the 8-bit string out of the request. Accepts {"value":"00000000"} as a JSON
 // body (whatever the Content-Type), a bare 8-bit body, or ?value=... in the URL.
-// Returns null when there is nothing usable (a plain GET, or a malformed body).
 function readInputBits(req) {
   let v;
   const raw = req.body;
@@ -530,20 +457,23 @@ function redoResponse(t) {
 
 // A pin only fires on its rising edge (0 -> 1), so a transmitter that keeps
 // POSTing the same "1" does not trigger it again on every poll.
+// In AI mode pins 1-2 are INTERRUPT / REDO; in OS mode pins 1-6 are the OS keys.
 function handleControlPins(t, bits) {
   t.lastIn = bits;
   if (t.prevIn !== null) {
     const rose = (i) => bits[i] === '1' && t.prevIn[i] === '0';
-    if (rose(PIN_INTERRUPT)) interruptResponse(t);
-    if (rose(PIN_REDO)) redoResponse(t);
+    if (t.mode === 'os') {
+      OS_PINS.forEach((name, i) => { if (rose(i)) osKey(t, name); });
+    } else {
+      if (rose(PIN_INTERRUPT)) interruptResponse(t);
+      if (rose(PIN_REDO)) redoResponse(t);
+    }
   }
   t.prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
 }
 
 // The game calls this. The pass header chooses the transmitter. GET = plain poll.
 // POST = the transmitter's pin state comes in the body and is handled first.
-// Either way, each call consumes one frame from that transmitter's queue and the
-// answer is {"value":"........"}.
 function outHandler(req, res) {
   const password = givenPassword(req);
   if (!password) {
@@ -572,7 +502,6 @@ app.route('/out').get(outHandler).post(outHandler);
 
 // ======================= GROQ HELPERS =======================
 
-// Everything that sends something to a panel needs a verified key.
 function requireKey(res) {
   if (groqKey) return true;
   res.status(409).json({ error: 'No Groq API key set yet. Paste your gsk_... key on the page first.' });
@@ -604,8 +533,7 @@ function cleanReply(text) {
   return out.join('').replace(/\s+/g, ' ').trim();
 }
 
-// Last-resort length cap, only used when the model still refuses to be short.
-// Cuts at a word boundary so a word is never split.
+// Last-resort length cap. Cuts at a word boundary so a word is never split.
 function finalizeReply(text) {
   let t = cleanReply(text);
   if (t.length <= REPLY_HARD_CHARS) return t;
@@ -617,14 +545,10 @@ function finalizeReply(text) {
 
 function currentSystemPrompt(t) {
   const persona = t.customPrompt !== null ? t.customPrompt : DEFAULT_PERSONA;
-  // The default persona always gets the panel rules; a custom prompt gets them
-  // only when the box is ticked.
   if (t.customPrompt === null || t.appendRules) return persona.trim() + ' ' + PANEL_RULES;
   return persona.trim();
 }
 
-// One Groq call. Returns { content, finishReason } where finishReason is 'stop',
-// 'length', etc. 'length' means the reply was cut off by the token budget.
 async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
   const r = await fetch(GROQ_CHAT_URL, {
     method: 'POST',
@@ -657,13 +581,10 @@ async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
   };
 }
 
-// Ask for a short reply, and if it came back cut off or over-long, retry (up to
-// RETRY_LIMIT times) asking the model for a COMPLETE shorter answer. Never returns
-// a mid-word cut.
 async function askGroq(t, message, hist = t.history) {
   const base = [
-    { role: 'system', content: currentSystemPrompt(t) }, // default or the transmitter's prompt
-    ...hist, // remembered turns (for a redo: without the answer being replaced)
+    { role: 'system', content: currentSystemPrompt(t) },
+    ...hist,
     { role: 'user', content: message },
   ];
 
@@ -687,7 +608,6 @@ async function askGroq(t, message, hist = t.history) {
     if (attempts === RETRY_LIMIT) break;
     attempts++;
 
-    // Ask again: include what was produced so the model can rewrite it completely.
     messages = [
       ...base,
       { role: 'assistant', content: content || '(no visible text)' },
@@ -695,12 +615,10 @@ async function askGroq(t, message, hist = t.history) {
     ];
 
     if (cutByTokens) {
-      // Also give the retry more headroom so the visible answer can finish.
       messages.push({ role: 'user', content: 'Use very few words so the whole answer fits.' });
     }
   }
 
-  // Retries exhausted: return whatever we have, never split a word.
   const clean = finalizeReply(lastContent);
   if (!clean) throw new Error('Model returned no usable text. Try again.');
   return clean;
@@ -714,8 +632,6 @@ function pushHistory(t, role, content) {
   if (t.history.length > cap) t.history = t.history.slice(-cap);
 }
 
-// Throw away any AI request that is still in flight (its answer is ignored when it
-// arrives) and free the "busy" lock so new messages and REDO work straight away.
 function abandonChat(t) {
   t.chatGen++;
   t.chatBusy = false;
@@ -729,7 +645,6 @@ function clearHistory(t) {
 
 // Ask the AI and put the exchange on the panel. Used by the web page (/api/chat) and
 // by the REDO pin. redo = true replaces the last exchange instead of adding a new one.
-// Resolves to { reply } or { interrupted: true }; throws if Groq fails.
 async function runChat(t, message, redo = false) {
   const myGen = ++t.chatGen;
   t.chatBusy = true;
@@ -742,7 +657,6 @@ async function runChat(t, message, redo = false) {
   }
   if (myGen !== t.chatGen) return { interrupted: true };
 
-  // Remember this exchange only after a successful reply.
   if (redo) t.history = base.slice();
   pushHistory(t, 'user', message);
   pushHistory(t, 'assistant', reply);
@@ -752,7 +666,6 @@ async function runChat(t, message, redo = false) {
   if (CLEAR_BEFORE_TEXT) t.queue.push(...clearFrames());
 
   if (SHOW_INPUT) {
-    // Echo only characters the panel can draw, so nothing turns into '?'
     const body = Array.from(cleanReply(message)).slice(0, ECHO_MAX_CHARS);
     const echo = [...Array.from(ECHO_PREFIX), ...body, ...Array.from(ECHO_SUFFIX)];
     const codes = [
@@ -767,20 +680,348 @@ async function runChat(t, message, redo = false) {
   return { reply };
 }
 
+// ======================= SIMULATED OS =======================
+//
+// A pretend operating system. Nothing real runs: it is a small state machine in this
+// process. It draws by queueing a clear + the characters of the current screen, exactly
+// like the AI mode does, so it works with the same panel wiring.
+//
+// KEYS (pins 1-6 of the value POSTed to /out, in OS mode)
+//   POWER  toggles the machine on/off (off = blank screen, state forgotten)
+//   DOWN / UP / SELECT / FN1 / FN2: behaviour depends on the app, see below.
+//
+// HOME SCREEN   DOWN / UP move the highlight (the highlighted app is in CAPITALS),
+//               SELECT opens it.
+//
+// term (command processor)
+//   FN1     scroll the letter at the cursor: a b c ... z 0 1 ... 9 and around again.
+//           The letter being scrolled is shown in CAPITALS; "_" means no letter yet.
+//   UP      accept the scrolled letter (it becomes part of the line)
+//   FN2     put a space (accepts the scrolled letter first)
+//   SELECT  go back: cancels the scrolled letter, else deletes the last character,
+//           else (empty line) returns to the home screen
+//   DOWN    run the line (accepts the scrolled letter first)
+//   After a command runs its output is shown in pages: DOWN = next page (after the last
+//   page you are back at the prompt), UP = previous page, SELECT/FN1/FN2 = back to prompt.
+//   Commands: help echo time date up rand add sub mul div ver clr exit off
+//
+// clok   shows HHMM and MMDD (server time). Any key but SELECT redraws it. SELECT = home.
+// dice   UP/DOWN pick the die (d4 d6 d8 d10 d12 d20 d100), FN1/FN2 roll, SELECT = home.
+// info   UP/DOWN flip through pages (version, uptime, app count, last key). SELECT = home.
+
+// Screen size in characters. OS_COLS follows CHARS_PER_ROW. OS_ROWS is how many text rows
+// your panel shows: 2 is a guess for a 16x16 panel (6 px per row). Raise it if more fit.
+const OS_COLS = CHARS_PER_ROW || 4;
+const OS_ROWS = 2;
+const OS_VERSION = '1.0';
+
+// Which input pin is which key (0 = first pin = leftmost bit of the posted value)
+const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];
+
+const TERM_LETTERS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const TERM_MAX = 40;
+const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
+
+// Names are 4 letters so they fit the default 4-wide screen.
+const APPS = [
+  { id: 'term', name: 'term' },
+  { id: 'clok', name: 'clok' },
+  { id: 'dice', name: 'dice' },
+  { id: 'info', name: 'info' },
+];
+
+function makeOS() {
+  return {
+    power: false,
+    app: 'home',
+    cursor: 0,
+    top: 0,
+    bootedAt: 0,
+    lastKey: '',
+    screen: [],                              // rows currently on the screen (for the web page)
+    term: { buf: '', pending: '', out: null, page: 0 },
+    dice: { side: 1, result: null },
+    info: { page: 0 },
+  };
+}
+
+const pad2 = (v) => String(v).padStart(2, '0');
+
+// Cut a string into chunks of one screen row
+function wrapRows(text, cols = OS_COLS) {
+  const s = String(text);
+  const rows = [];
+  for (let i = 0; i < s.length; i += cols) rows.push(s.slice(i, i + cols));
+  return rows.length ? rows : [''];
+}
+
+// Lines of output -> pages of OS_ROWS rows (each line starts on a new row)
+function pagesFromLines(lines) {
+  const rows = [];
+  for (const line of lines) rows.push(...wrapRows(line));
+  const pages = [];
+  for (let i = 0; i < rows.length; i += OS_ROWS) pages.push(rows.slice(i, i + OS_ROWS));
+  return pages.length ? pages : [['']];
+}
+
+// ---- Building the screen ----
+
+function homeRows(os) {
+  if (os.cursor < os.top) os.top = os.cursor;
+  if (os.cursor >= os.top + OS_ROWS) os.top = os.cursor - OS_ROWS + 1;
+  return APPS.slice(os.top, os.top + OS_ROWS).map((a, i) => {
+    const name = a.name.slice(0, OS_COLS);
+    return os.top + i === os.cursor ? name.toUpperCase() : name;
+  });
+}
+
+function infoPages(os) {
+  return [
+    ['os', 'v' + OS_VERSION],
+    ['up', Math.floor((Date.now() - os.bootedAt) / 60000) + 'm'],
+    ['apps', String(APPS.length)],
+    ['key', os.lastKey || '-'],
+  ];
+}
+
+function osRows(t) {
+  const os = t.os;
+  switch (os.app) {
+    case 'home':
+      return homeRows(os);
+    case 'term': {
+      const tm = os.term;
+      if (tm.out) return tm.out[tm.page];
+      const shown = tm.buf + (tm.pending ? tm.pending.toUpperCase() : '_');
+      return wrapRows(shown).slice(-OS_ROWS);
+    }
+    case 'clok': {
+      const d = new Date();
+      return [pad2(d.getHours()) + pad2(d.getMinutes()), pad2(d.getMonth() + 1) + pad2(d.getDate())];
+    }
+    case 'dice':
+      return ['d' + DICE_SIDES[os.dice.side], os.dice.result === null ? '-' : String(os.dice.result)];
+    case 'info':
+      return infoPages(os)[os.info.page];
+    default:
+      return ['err'];
+  }
+}
+
+// Row -> character codes. Rows are padded out to the row width so the next row starts at
+// the beginning of a fresh line on the panel (or NEWLINE_CODE is used if you have one).
+function osRowBreak(len) {
+  if (NEWLINE_CODE !== null) return [NEWLINE_CODE & 127];
+  const pad = len === 0 ? OS_COLS : (OS_COLS - (len % OS_COLS)) % OS_COLS;
+  return Array(pad).fill(SPACE_CODE);
+}
+
+function osCodes(rows) {
+  const codes = [];
+  const shown = rows.slice(0, OS_ROWS);
+  shown.forEach((row, i) => {
+    const chars = Array.from(row).slice(0, OS_COLS);
+    codes.push(...chars.map(encode));
+    if (i < shown.length - 1) codes.push(...osRowBreak(chars.length));
+  });
+  return codes;
+}
+
+// Replace whatever is queued with: clear, then these rows. Pressing keys quickly just
+// restarts the drawing, so frames never pile up.
+function osDraw(t, rows) {
+  t.os.screen = rows.slice(0, OS_ROWS);
+  t.queue = [];
+  t.queue.push(...clearFrames());
+  const codes = osCodes(rows);
+  if (codes.length) t.queue.push(...buildFrames(t, codes));
+}
+
+function osRefresh(t) {
+  osDraw(t, osRows(t));
+}
+
+function osPower(t, on) {
+  t.os = makeOS();
+  t.queue = [];
+  t.queue.push(...clearFrames());
+  if (on) {
+    t.os.power = true;
+    t.os.bootedAt = Date.now();
+    t.queue.push(...buildFrames(t, osCodes(['boot'])));   // splash
+    const rows = osRows(t);
+    t.os.screen = rows.slice(0, OS_ROWS);
+    t.queue.push(...clearFrames());
+    t.queue.push(...buildFrames(t, osCodes(rows)));       // home screen
+    noteAction(t, 'OS power ON');
+  } else {
+    noteAction(t, 'OS power OFF');
+  }
+}
+
+// ---- Commands (term) ----
+
+function runCommand(t) {
+  const tm = t.os.term;
+  const line = tm.buf.trim();
+  tm.buf = '';
+  tm.pending = '';
+  if (!line) return;
+  const [cmd, ...args] = line.split(/\s+/);
+  const d = new Date();
+  let out;
+  switch (cmd) {
+    case 'help':
+      out = ['echo', 'time', 'date', 'up', 'rand', 'add', 'sub', 'mul', 'div', 'ver', 'clr', 'exit', 'off'];
+      break;
+    case 'echo':
+      out = [args.join(' ')];
+      break;
+    case 'time':
+      out = [pad2(d.getHours()) + pad2(d.getMinutes()), pad2(d.getSeconds()) + 's'];
+      break;
+    case 'date':
+      out = [pad2(d.getMonth() + 1) + pad2(d.getDate()), String(d.getFullYear())];
+      break;
+    case 'up': {
+      const secs = Math.floor((Date.now() - t.os.bootedAt) / 1000);
+      out = [Math.floor(secs / 60) + 'm', (secs % 60) + 's'];
+      break;
+    }
+    case 'rand': {
+      const max = parseInt(args[0], 10);
+      out = [String(Math.floor(Math.random() * (max > 0 ? max : 100)))];
+      break;
+    }
+    case 'add': case 'sub': case 'mul': case 'div': {
+      const a = Number(args[0]);
+      const b = Number(args[1]);
+      if (args.length < 2 || Number.isNaN(a) || Number.isNaN(b)) { out = ['err', 'args']; break; }
+      if (cmd === 'div' && b === 0) { out = ['div0']; break; }
+      const res = cmd === 'add' ? a + b : cmd === 'sub' ? a - b : cmd === 'mul' ? a * b : a / b;
+      out = [String(Math.round(res * 1000) / 1000)];
+      break;
+    }
+    case 'ver':
+      out = ['bldos', 'v' + OS_VERSION];
+      break;
+    case 'clr':
+      return;
+    case 'exit':
+      t.os.app = 'home';
+      return;
+    case 'off':
+      osPower(t, false);
+      return;
+    default:
+      out = ['err', cmd];
+  }
+  tm.out = pagesFromLines(out);
+  tm.page = 0;
+}
+
+// ---- Key handling ----
+
+function termKey(t, key) {
+  const tm = t.os.term;
+
+  if (tm.out) { // looking at a command's output
+    if (key === 'down') {
+      if (tm.page < tm.out.length - 1) tm.page++; else tm.out = null;
+    } else if (key === 'up') {
+      if (tm.page > 0) tm.page--;
+    } else {
+      tm.out = null; // select / fn1 / fn2: back to the prompt
+    }
+    return;
+  }
+
+  const commit = () => {
+    if (tm.pending) {
+      if (tm.buf.length < TERM_MAX) tm.buf += tm.pending;
+      tm.pending = '';
+    }
+  };
+
+  switch (key) {
+    case 'fn1': {
+      const i = tm.pending ? TERM_LETTERS.indexOf(tm.pending) : -1;
+      tm.pending = TERM_LETTERS[(i + 1) % TERM_LETTERS.length];
+      break;
+    }
+    case 'up':
+      commit();
+      break;
+    case 'fn2':
+      commit();
+      if (tm.buf.length > 0 && tm.buf.length < TERM_MAX && !tm.buf.endsWith(' ')) tm.buf += ' ';
+      break;
+    case 'select':
+      if (tm.pending) tm.pending = '';
+      else if (tm.buf.length) tm.buf = tm.buf.slice(0, -1);
+      else t.os.app = 'home';
+      break;
+    case 'down':
+      commit();
+      runCommand(t);
+      break;
+  }
+}
+
+function homeKey(t, key) {
+  const os = t.os;
+  const count = APPS.length;
+  if (key === 'down') os.cursor = (os.cursor + 1) % count;
+  else if (key === 'up') os.cursor = (os.cursor - 1 + count) % count;
+  else if (key === 'select') {
+    os.app = APPS[os.cursor].id;
+    if (os.app === 'term') os.term = { buf: '', pending: '', out: null, page: 0 };
+    if (os.app === 'dice') os.dice.result = 1 + Math.floor(Math.random() * DICE_SIDES[os.dice.side]);
+    if (os.app === 'info') os.info.page = 0;
+  }
+}
+
+function appKey(t, key) {
+  const os = t.os;
+  if (key === 'select') { os.app = 'home'; return; }
+  if (os.app === 'dice') {
+    const count = DICE_SIDES.length;
+    if (key === 'down') { os.dice.side = (os.dice.side + 1) % count; os.dice.result = null; }
+    else if (key === 'up') { os.dice.side = (os.dice.side - 1 + count) % count; os.dice.result = null; }
+    else os.dice.result = 1 + Math.floor(Math.random() * DICE_SIDES[os.dice.side]); // fn1 / fn2
+  } else if (os.app === 'info') {
+    const count = infoPages(os).length;
+    if (key === 'down') os.info.page = (os.info.page + 1) % count;
+    else if (key === 'up') os.info.page = (os.info.page - 1 + count) % count;
+  }
+  // clok: any other key just redraws it
+}
+
+// One key press, from a pin (rising edge) or from the web page's test buttons.
+function osKey(t, key) {
+  if (key === 'power') { osPower(t, !t.os.power); return; }
+  if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (power off)'); return; }
+
+  t.os.lastKey = key;
+  if (t.os.app === 'home') homeKey(t, key);
+  else if (t.os.app === 'term') termKey(t, key);
+  else appKey(t, key);
+
+  if (t.os.power) osRefresh(t); // a command like "off" may have switched it off
+  noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
+}
+
 // ======================= API FOR THE WEB PAGE =======================
 
 const n = (v, max) => Math.max(0, Math.min(max, Number(v) | 0));
 
-// Set / clear the Groq key. A non-empty key is checked against api.groq.com first,
-// so a typo is caught immediately instead of silently breaking every send.
-// The key is shared by all transmitters on this server.
 app.post('/api/key', async (req, res) => {
   const key = String(req.body.key || '').trim();
 
   if (!key) {
     groqKey = '';
     for (const t of transmitters.values()) clearHistory(t); // forgetting the key forgets every conversation
-    return res.json({ ok: true, key: false, message: 'Key forgotten. Every panel is locked.' });
+    return res.json({ ok: true, key: false, message: 'Key forgotten. Every AI panel is locked.' });
   }
   if (key.length < 20) {
     return res.status(400).json({ error: 'That does not look like a Groq key (too short).' });
@@ -800,7 +1041,6 @@ app.post('/api/key', async (req, res) => {
   res.json({ ok: true, key: true, message: 'Key set — every panel on this server is unlocked.' });
 });
 
-// Read the prompt currently in use by THIS transmitter (the page loads this).
 app.get('/api/prompt', (req, res) => {
   const t = req.transmitter;
   res.json({
@@ -813,8 +1053,6 @@ app.get('/api/prompt', (req, res) => {
   });
 });
 
-// Set this transmitter's own prompt. An empty prompt goes back to the default.
-// Changing the prompt also starts a fresh conversation for this transmitter.
 app.post('/api/prompt', (req, res) => {
   const t = req.transmitter;
   const prompt = String(req.body.prompt || '').trim();
@@ -840,6 +1078,9 @@ app.post('/api/prompt', (req, res) => {
 app.post('/api/chat', async (req, res) => {
   const t = req.transmitter;
   if (!requireKey(res)) return;
+  if (t.mode === 'os') {
+    return res.status(409).json({ error: 'This transmitter is in OS mode. Switch it to AI mode in section 5 to chat.' });
+  }
   if (t.chatBusy) return res.status(429).json({ error: 'Still working on the previous message.' });
 
   const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
@@ -863,7 +1104,6 @@ app.post('/api/chat', async (req, res) => {
   res.json({ reply: result.reply, queued: t.queue.length, memory: t.history.length / 2 });
 });
 
-// Same as the INTERRUPT / REDO pins, for testing from the page.
 app.post('/api/interrupt', (req, res) => {
   interruptResponse(req.transmitter);
   res.json({ ok: true, queued: req.transmitter.queue.length });
@@ -875,16 +1115,39 @@ app.post('/api/redo', (req, res) => {
   res.json({ ok: true, action: req.transmitter.lastAction });
 });
 
-// Forget this transmitter's conversation (the key is kept).
 app.post('/api/memory/clear', (req, res) => {
   clearHistory(req.transmitter);
   res.json({ ok: true, memory: 0 });
 });
 
+// ---- Simulated OS ----
+
+// Switch this transmitter between the AI text sender and the simulated OS.
+app.post('/api/os/mode', (req, res) => {
+  const t = req.transmitter;
+  const mode = req.body.mode === 'os' ? 'os' : 'ai';
+  abandonChat(t);
+  t.mode = mode;
+  t.queue = [];
+  if (mode === 'os' && t.os.power) osRefresh(t);
+  else t.queue.push(...clearFrames());
+  noteAction(t, 'mode: ' + mode);
+  res.json({ ok: true, mode });
+});
+
+// Press an OS key from the page (same as the matching pin from the game).
+app.post('/api/os/key', (req, res) => {
+  const t = req.transmitter;
+  const key = String(req.body.key || '');
+  if (!OS_PINS.includes(key)) return res.status(400).json({ error: 'Unknown key.' });
+  if (t.mode !== 'os') return res.status(409).json({ error: 'Switch this transmitter to OS mode first.' });
+  osKey(t, key);
+  res.json({ ok: true, power: t.os.power, screen: t.os.screen });
+});
+
 app.post('/api/text', (req, res) => {
   const t = req.transmitter;
   if (!requireKey(res)) return;
-  // Remove emoji variation selectors (arrows often arrive with one) and line breaks
   const text = String(req.body.text || '').replace(/\uFE0F/g, '').replace(/[\r\n]/g, ' ');
   if (CLEAR_BEFORE_TEXT) t.queue.push(...clearFrames());
   t.queue.push(...buildFrames(t, Array.from(text).slice(0, 200).map(encode)));
@@ -907,7 +1170,6 @@ app.post('/api/code', (req, res) => {
   res.json({ queued: t.queue.length });
 });
 
-// Sends every code from..to in order so you can watch what each one draws
 app.post('/api/sweep', (req, res) => {
   const t = req.transmitter;
   if (!requireKey(res)) return;
@@ -919,7 +1181,6 @@ app.post('/api/sweep', (req, res) => {
   res.json({ queued: t.queue.length });
 });
 
-// Hold an exact 8-bit string on this transmitter's pins until released
 app.post('/api/hold', (req, res) => {
   const t = req.transmitter;
   if (!requireKey(res)) return;
@@ -946,6 +1207,8 @@ app.get('/api/status', (req, res) => {
   const t = req.transmitter;
   res.json({
     key: !!groqKey,
+    mode: t.mode,
+    os: { power: t.os.power, app: t.os.app, screen: t.os.screen, lastKey: t.os.lastKey },
     model: GROQ_MODEL,
     prompt: t.customPrompt !== null ? 'custom' : 'default',
     memory: t.history.length / 2,
@@ -999,6 +1262,8 @@ const PAGE = `<!doctype html>
   code { background:#333; padding:0 .25rem; border-radius:4px; }
   details { background:#1c1c1c; border-radius:12px; padding:1rem; }
   summary { cursor:pointer; font-weight:600; }
+  pre.screen { background:#000; color:#7f7; font-family:monospace; font-size:1.5rem; line-height:1.3; letter-spacing:.2em; white-space:pre; padding:.6rem .8rem; border-radius:8px; margin:.4rem .2rem; min-height:3.6rem; }
+  .keys button { min-width:5.2rem; }
 </style>
 <h1>Panel Text</h1>
 
@@ -1010,7 +1275,7 @@ const PAGE = `<!doctype html>
   <button id="connectbtn" onclick="connect()">Connect</button>
   <button class="gray" onclick="genPass()">Generate</button>
   <button class="gray" onclick="disconnect()">Disconnect</button>
-  <small>Type the same password you put in your in-game HTTP Transmitter. A new password creates a new transmitter (a separate panel); typing an existing one goes back to it. Each password has its own queue, conversation and prompt, so you can drive several panels from this server. Each browser tab remembers its own password, so open a second tab for a second panel.</small>
+  <small>Type the same password you put in your in-game HTTP Transmitter. A new password creates a new transmitter (a separate panel); typing an existing one goes back to it. Each password has its own queue, conversation, prompt and OS, so you can drive several panels from this server. Each browser tab remembers its own password, so open a second tab for a second panel.</small>
   <div class="st">Headers dictionary for the game's HTTP Transmitter:</div>
   <textarea id="dict" class="dict" readonly spellcheck="false" placeholder='{"pass":"your-password"}'></textarea>
   <button class="gray" onclick="copyDict()">Copy dictionary</button>
@@ -1018,16 +1283,16 @@ const PAGE = `<!doctype html>
 </section>
 
 <section id="keysec" class="locked">
-  <h2>2. Groq API key (required)</h2>
+  <h2>2. Groq API key (AI mode only)</h2>
   <input id="key" type="password" placeholder="gsk_..." autocomplete="off">
   <button onclick="saveKey()">Save key</button>
   <button class="gray" onclick="forgetKey()">Forget key</button>
-  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. No panel works until a working key is set.</small>
+  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. The AI features need it; the simulated OS does not.</small>
   <div class="st" id="keyst">not connected</div>
 </section>
 
 <section id="chatsec" class="locked">
-  <h2>3. Message</h2>
+  <h2>3. Message (AI mode)</h2>
   <input id="msg" type="text" placeholder="Say something..." autocomplete="off">
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
@@ -1043,6 +1308,24 @@ const PAGE = `<!doctype html>
   <button class="gray" onclick="resetPrompt()">Reset to default</button>
   <small>Example: You are a grumpy pirate. Answer in pirate slang. Saving starts a new conversation on this transmitter. Leave the box empty and save to go back to the default. Kept in memory only.</small>
   <div class="st" id="promptst"></div>
+</section>
+
+<section id="ossec" class="locked">
+  <h2>5. Simulated OS (same password)</h2>
+  <div class="st" id="osmode">mode: AI text sender</div>
+  <button id="osmodebtn" onclick="toggleOsMode()">Switch to OS mode</button>
+  <small>In OS mode the pins the game POSTs become keys: pin 1 power, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The AI chat is paused until you switch back. No Groq key needed.</small>
+  <pre class="screen" id="osscreen">(AI mode)</pre>
+  <div class="keys">
+    <button onclick="osKey('power')">Power (1)</button>
+    <button onclick="osKey('down')">Down (2)</button>
+    <button onclick="osKey('up')">Up (3)</button><br>
+    <button onclick="osKey('select')">Select (4)</button>
+    <button onclick="osKey('fn1')">FN1 (5)</button>
+    <button onclick="osKey('fn2')">FN2 (6)</button>
+  </div>
+  <div class="st" id="osst"></div>
+  <small>Home: up/down move, select opens (highlighted app is in CAPITALS). term: FN1 scrolls letters, up accepts the letter, FN2 = space, select = back/delete, down = run (try: help). Apps: term, clok, dice, info.</small>
 </section>
 
 <details>
@@ -1078,7 +1361,7 @@ const PAGE = `<!doctype html>
   </section>
 
   <section>
-    <h2>Control pins (test)</h2>
+    <h2>Control pins (test, AI mode)</h2>
     <button class="gray" onclick="post('/api/interrupt')">Interrupt</button>
     <button class="gray needs-key" onclick="post('/api/redo')">Redo</button><br>
     <small>Same as pin 1 and pin 2 of the value the game POSTs to /out.</small>
@@ -1104,6 +1387,7 @@ const PAGE = `<!doctype html>
   var passSet = false;
   var keySet = false;
   var sending = false;
+  var osMode = 'ai';
 
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
@@ -1112,7 +1396,6 @@ const PAGE = `<!doctype html>
     try { if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass'); } catch (e) {}
   }
 
-  // Headers for every request: the JSON bits plus the password in the pass header.
   function passHeaders() {
     var h = {};
     for (var k in H) h[k] = H[k];
@@ -1128,7 +1411,6 @@ const PAGE = `<!doctype html>
     el.value = JSON.stringify(d);
   }
 
-  // Enable/disable everything from the two gates: password entered, key set.
   function applyGates() {
     var btns = document.querySelectorAll('button');
     for (var i = 0; i < btns.length; i++) {
@@ -1140,6 +1422,7 @@ const PAGE = `<!doctype html>
     document.getElementById('keysec').className = (passSet && keySet) ? '' : 'locked';
     document.getElementById('chatsec').className = passSet ? '' : 'locked';
     document.getElementById('promptsec').className = passSet ? '' : 'locked';
+    document.getElementById('ossec').className = passSet ? '' : 'locked';
     document.getElementById('passsec').className = passSet ? '' : 'locked';
   }
 
@@ -1147,7 +1430,7 @@ const PAGE = `<!doctype html>
     keySet = !!on;
     var box = document.getElementById('keyst');
     box.textContent = !passSet ? 'not connected (enter a password first)'
-      : (keySet ? 'Key set - the panel is unlocked.' : 'No key set - everything is locked.');
+      : (keySet ? 'Key set - the AI is unlocked.' : 'No key set - AI mode is locked (the OS still works).');
     box.className = 'st ' + (keySet && passSet ? 'ok' : 'bad');
     applyGates();
   }
@@ -1187,6 +1470,8 @@ const PAGE = `<!doctype html>
     document.getElementById('reply').textContent = '';
     document.getElementById('prompt').value = '';
     document.getElementById('promptst').textContent = '';
+    document.getElementById('osscreen').textContent = '(AI mode)';
+    document.getElementById('osst').textContent = '';
     clearStatusLines();
     var box = document.getElementById('passst');
     box.textContent = 'not connected';
@@ -1256,9 +1541,27 @@ const PAGE = `<!doctype html>
     document.getElementById('reply').textContent = 'new conversation';
   }
 
+  // ---- Simulated OS ----
+  async function toggleOsMode() {
+    await post('/api/os/mode', { mode: osMode === 'os' ? 'ai' : 'os' });
+  }
+
+  async function osKey(k) {
+    var box = document.getElementById('osst');
+    try {
+      var r = await fetch('/api/os/key', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ key: k }) });
+      var j = {};
+      try { j = await r.json(); } catch (e) {}
+      box.textContent = r.ok ? 'pressed ' + k : (j.error || 'error ' + r.status);
+      box.className = 'st ' + (r.ok ? 'ok' : 'bad');
+    } catch (e) {
+      box.textContent = 'error: ' + e.message;
+      box.className = 'st bad';
+    }
+    refresh();
+  }
+
   // ---- AI prompt ----
-  // Loaded after connecting (not on the 0.5 s refresh) so it never overwrites
-  // what you are typing.
   async function loadPrompt() {
     if (!passSet) return;
     try {
@@ -1338,6 +1641,17 @@ const PAGE = `<!doctype html>
       if (!r.ok) return;
       var s = await r.json();
       applyKey(s.key);
+
+      osMode = s.mode;
+      document.getElementById('osmode').textContent = s.mode === 'os'
+        ? 'mode: simulated OS (pins 1-6 are keys) | power: ' + (s.os.power ? 'on, app: ' + s.os.app : 'off')
+        : 'mode: AI text sender (pins 1-2 are interrupt / redo)';
+      document.getElementById('osmodebtn').textContent = s.mode === 'os' ? 'Switch back to AI mode' : 'Switch to OS mode';
+      var scr = document.getElementById('osscreen');
+      if (s.mode !== 'os') scr.textContent = '(AI mode)';
+      else if (!s.os.power) scr.textContent = '(power off)';
+      else scr.textContent = s.os.screen.join(String.fromCharCode(10)) || ' ';
+
       var box = document.getElementById('passst');
       var tr = s.transmitter;
       if (tr.lastPollAgoMs === null) {
@@ -1356,7 +1670,7 @@ const PAGE = `<!doctype html>
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
       document.getElementById('st6').textContent = 'callers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
-      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' (pin 1 = interrupt, pin 2 = redo) | last action: ' + (s.action || 'none');
+      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' | last action: ' + (s.action || 'none');
       document.getElementById('st9').textContent = 'transmitters on this server: ' + tr.count + ' | this one created ' + new Date(tr.createdAt).toLocaleString();
     } catch (e) {}
   }
@@ -1368,8 +1682,6 @@ const PAGE = `<!doctype html>
     if (e.key === 'Enter') connect();
   });
 
-  // Restore the password from this tab, if any. If the server has since forgotten
-  // that transmitter, it just looks like a fresh empty one until the game polls.
   pass = storedPass();
   passSet = !!pass;
   applyGates();
@@ -1391,6 +1703,7 @@ app.listen(PORT, () => {
   console.log('  Headers dictionary:  ' + dictionary);
   console.log('  Each different pass value is a separate panel with its own queue.');
   console.log('  The page itself is open. Type the same password into it to control that panel.');
-  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page.');
+  console.log('  Simulated OS: switch a panel to OS mode in section 5 of the page.');
+  console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page (AI mode only; the OS does not need it).');
   console.log(INITIAL_PROMPT !== null ? 'New transmitters start with the PANEL_PROMPT prompt.' : 'New transmitters start with the default prompt (change it per panel on the page).');
 });

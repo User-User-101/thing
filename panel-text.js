@@ -11,7 +11,7 @@
 //   script). The panel shows ONE line. The pins the transmitter POSTs are the keys:
 //        pin 1 = I/O (on / off; off = blank screen until pressed again)
 //        pin 2 = DOWN    pin 3 = UP    pin 4 = SELECT    pin 5 = FN1    pin 6 = FN2
-//   UP / DOWN change the selected app, SELECT opens it. Apps: ai chat, terminal, clock, dice.
+//   UP / DOWN change the selected app, SELECT opens it. Apps: ai chat, terminal, text editor, clock, dice.
 //   Every handled key press clears the panel first. Details in the SIMULATED OS section below.
 //
 // The conversation (AI mode) is remembered server-side (the last MAX_HISTORY_TURNS
@@ -791,23 +791,22 @@ async function runOsChat(t, message) {
 //   pin 5  FN1
 //   pin 6  FN2
 //
-// MENU      the selected app is shown with a "▶" arrow and a position counter (1/4).
+// MENU      the selected app is shown with a "▶" arrow and a position counter.
 //           UP / DOWN change it, SELECT opens it.
-// terminal  FN1 scrolls the letter (a-z, 0-9; shown in CAPITALS), UP accepts it, FN2 = space,
-//           SELECT = back (deletes; on an empty line it returns to the menu),
-//           DOWN = run the line. The prompt shows ">" and a "_" cursor.
-//           The result is one line; any key goes back to typing.
-//           Commands: help echo time date rand add sub mul div ver exit off
+// terminal  FN1 scrolls a-z and 0-9; UP accepts; FN2 inserts a space; DOWN runs.
+//           SELECT cancels the pending character, deletes, or exits when empty.
+// text editor  FN1 cycles SPACE, a-z (in that order); FN2 inserts the selection and
+//           advances to the next character. SELECT cancels/deletes; when empty it exits.
+//           DOWN finishes and returns to the menu. Text stays until the OS is powered off.
 // ai chat   Uses the Groq key. You type on the WEB PAGE ("3. Message"), the panel
-//           shows the answer with "(click select to exit)" at the end.
-//           SELECT = back to the menu.
+//           shows the answer with "(click select to exit)" at the end. SELECT = back.
 // clock     shows the time. FN1 refreshes. SELECT = back.
 // dice      FN1 rolls. UP / DOWN pick the die. SELECT = back.
 
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
-const OS_VERSION = '1.0';
+const OS_VERSION = '1.1';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
 const OS_DEBOUNCE_MS = 40;   // short bounce filter; edge detection prevents held-button repeats
 
@@ -819,12 +818,16 @@ const POWER_ON_FALLING_EDGE = false;
 const APPS = [
   { id: 'ai', name: 'ai chat' },
   { id: 'term', name: 'terminal' },
+  { id: 'edit', name: 'text edit' },
   { id: 'clok', name: 'clock' },
   { id: 'dice', name: 'dice' },
 ];
 
 const TERM_LETTERS = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const TERM_MAX = 40;
+// The editor's FN1 cycle starts with a space, followed by a through z.
+const EDITOR_LETTERS = ' abcdefghijklmnopqrstuvwxyz';
+const EDITOR_MAX = 120;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 
 function makeOS() {
@@ -837,6 +840,7 @@ function makeOS() {
     lastKey: '',
     debounce: {},      // per-key timestamps for edge-debounce
     term: { buf: '', pending: '', out: null },
+    editor: { text: '', choice: -1 },
     dice: { side: 1, result: null },
     ai: { shown: false, text: '' },  // text = full multi-row AI answer
   };
@@ -864,6 +868,13 @@ function osLine(t) {
       if (tm.out !== null) return tm.out;
       const text = tm.buf + (tm.pending ? tm.pending.toUpperCase() : '') + '_';
       return '> ' + text.slice(-(CHARS_PER_ROW - 2));
+    }
+    case 'edit': {
+      const ed = os.editor;
+      const marker = ed.choice < 0 ? '_' : (EDITOR_LETTERS[ed.choice] === ' ' ? 'SP' : EDITOR_LETTERS[ed.choice]);
+      const visibleCount = Math.max(0, CHARS_PER_ROW - 6 - marker.length);
+      const visibleText = Array.from(ed.text).slice(-visibleCount).join('');
+      return 'EDIT:' + visibleText + '=' + marker;
     }
     case 'clok': {
       const d = new Date();
@@ -907,6 +918,7 @@ function osPower(t, on) {
   os.screen = '';
   os.lastKey = '';
   os.term = { buf: '', pending: '', out: null };
+  os.editor = { text: '', choice: -1 };
   os.dice = { side: 1, result: null };
   os.ai = { shown: false, text: '' };
   if (on) {
@@ -985,6 +997,32 @@ function termKey(t, key) {
   }
 }
 
+// ---- text editor ----
+
+function editorKey(t, key) {
+  const ed = t.os.editor;
+
+  if (key === 'fn1') {
+    // First FN1 press selects the space; subsequent presses go a, b, ... z.
+    ed.choice = (ed.choice + 1) % EDITOR_LETTERS.length;
+  } else if (key === 'fn2') {
+    // FN2 inserts the currently selected character and moves to a fresh position.
+    if (ed.choice >= 0) {
+      if (ed.text.length < EDITOR_MAX) ed.text += EDITOR_LETTERS[ed.choice];
+      ed.choice = -1;
+    }
+  } else if (key === 'select') {
+    // SELECT cancels a preview first; otherwise it acts as backspace.
+    if (ed.choice >= 0) ed.choice = -1;
+    else if (ed.text.length) ed.text = ed.text.slice(0, -1);
+    else t.os.app = 'menu';
+  } else if (key === 'down') {
+    // Finish editing. The text remains stored until the OS is powered off.
+    ed.choice = -1;
+    t.os.app = 'menu';
+  }
+}
+
 // ---- menu and the other apps ----
 
 function menuKey(t, key) {
@@ -1004,6 +1042,10 @@ function menuKey(t, key) {
 
 function appKey(t, key) {
   const os = t.os;
+  if (os.app === 'edit') {
+    editorKey(t, key);
+    return;
+  }
   if (key === 'select') {
     if (os.app === 'ai') abandonChat(t); // stop any in-flight Groq reply
     os.app = 'menu';
@@ -1425,7 +1467,7 @@ const PAGE = `<!doctype html>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
-  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: FN1 scrolls a letter, up accepts it, FN2 = space, select = back, down = run (try: help). clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
+  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: FN1 scrolls a letter, up accepts it, FN2 = space, select = back, down = run (try: help). text editor: FN1 cycles space then a-z; FN2 inserts that character and moves to the next position; select cancels/deletes; down finishes. clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
 </section>
 
 <details>

@@ -23,6 +23,15 @@
 // Web page (your browser):  https://YOUR-TUNNEL-URL/
 // Transmitter Url:          https://YOUR-TUNNEL-URL/out
 //
+// ACCESS: the page itself is open, but nothing on it works until you type the panel
+// password into it. Every /api call must carry that password in the X-Panel-Password
+// header, and the in-game HTTP Transmitter must send the same header when it polls
+// /out. So put a custom header on the transmitter:  X-Panel-Password: hi10h
+// (change the name with PASSWORD_HEADER=..., change the value with PANEL_PASSWORD=...).
+// The page remembers the password for the browser tab only.
+// /out also accepts ?token=secret when the server is started with OUT_TOKEN=secret,
+// for transmitters that cannot send headers.
+//
 // HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
 //   {"value":"00000000"}
 // and the server answers with the next panel frame, also as {"value":"........"}.
@@ -31,11 +40,6 @@
 //   pin 2 = REDO:      ask the AI again for the last message and draw the new answer
 // Both act once on the rising edge (0 -> 1), so holding a pin high does not repeat.
 // The other 6 pins are ignored. GET /out still works the old way (no controls).
-//
-// The page and its API ask for a password (HTTP Basic Auth; any username, the
-// password is what counts). The password is "hi10h"; override it by starting with
-// PANEL_PASSWORD=... . /out stays open for the game's HTTP Transmitter; add
-// OUT_TOKEN=secret to require /out?token=secret as well.
 //
 // The Groq API key is REQUIRED. Nothing is sent to the panel until a key is set
 // and verified against api.groq.com.
@@ -54,11 +58,18 @@ const app = express();
 
 // ======================= ACCESS CONTROL =======================
 
-// The page and every API call require this password (HTTP Basic Auth).
-// The username is ignored; only the password is checked.
+// The shared secret. The page is open, but every /api call has to send this password
+// in the PASSWORD_HEADER header, and so does the in-game HTTP Transmitter when it
+// polls /out. You type it into the page once; the page keeps it for that tab.
 const PASSWORD = String(process.env.PANEL_PASSWORD || 'hi10h').trim();
 
-// Optional: also require ?token=... on /out, so the tunnel URL alone is not enough.
+// Name of the header that carries the password. HTTP header names are
+// case-insensitive, so "X-Panel-Password: hi10h" on the transmitter is enough.
+// Set PASSWORD_HEADER=... to use a different name.
+const PASSWORD_HEADER = String(process.env.PASSWORD_HEADER || 'x-panel-password')
+  .trim().toLowerCase().replace(/[^a-z0-9-]/g, '') || 'x-panel-password';
+
+// Optional: /out also accepts ?token=... , for transmitters that cannot send headers.
 const OUT_TOKEN = String(process.env.OUT_TOKEN || '').trim();
 
 if (!PASSWORD) {
@@ -75,24 +86,19 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-// /out is exempt: the in-game transmitter polls it and cannot send a password.
-app.use((req, res, next) => {
-  if (req.path === '/out') return next();
-  const header = String(req.headers.authorization || '');
-  const ask = () => {
-    res.set('WWW-Authenticate', 'Basic realm="Panel Text", charset="UTF-8"');
-    return res.status(401).send('Password required.');
-  };
-  if (!header.startsWith('Basic ')) return ask();
-  let pass = '';
-  try {
-    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-    const i = decoded.indexOf(':');
-    pass = i >= 0 ? decoded.slice(i + 1) : '';
-  } catch (e) { /* fall through */ }
-  if (!safeEqual(pass, PASSWORD)) return ask();
-  next();
-});
+// The password the request sent in its header ('' when there is none).
+function givenPassword(req) {
+  const v = req.headers[PASSWORD_HEADER];
+  if (Array.isArray(v)) return String(v[0] || '');
+  return v === undefined || v === null ? '' : String(v);
+}
+
+// True when the request carries the right password header.
+function hasPassword(req) {
+  const given = givenPassword(req);
+  if (!given) return false;
+  return safeEqual(given, PASSWORD);
+}
 
 // Never let Express, a tunnel or the game cache /out: most frames are the same few
 // values, and a cached or 304 reply would hand the game stale data.
@@ -107,6 +113,16 @@ app.use((req, res, next) => {
 // This must come before express.json(), which then skips the already-read body.
 app.use('/out', express.text({ type: () => true }));
 app.use(express.json());
+
+// Everything under /api needs the password header. The page itself (/) is public,
+// but it cannot do anything until you type the password into it.
+app.use('/api', (req, res, next) => {
+  if (hasPassword(req)) return next();
+  return res.status(403).json({
+    error: 'Password required (send the ' + PASSWORD_HEADER + ' header).',
+    locked: true,
+  });
+});
 
 const PORT = 3000;
 
@@ -504,14 +520,29 @@ function handleControlPins(bits) {
   prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
 }
 
+// ---- /out access: the transmitter must send the password header (or ?token=) ----
+let outRejected = 0;   // polls turned away for a bad/missing password
+let outLastOk = null;  // when a transmitter last got through
+
+function outAuthorized(req) {
+  if (hasPassword(req)) return true;
+  if (OUT_TOKEN && safeEqual(String(req.query.token || ''), OUT_TOKEN)) return true;
+  return false;
+}
+
 // The game calls this. GET = plain poll. POST = the transmitter's pin state comes in
 // the body and is handled first. Either way, each call consumes one frame from the queue
 // and the answer is {"value":"........"}.
 function outHandler(req, res) {
-  notePoll(req);
-  if (OUT_TOKEN && req.query.token !== OUT_TOKEN) {
-    return res.status(401).json({ error: 'bad or missing token' });
+  if (!outAuthorized(req)) {
+    outRejected++;
+    return res.status(403).json({
+      error: 'bad or missing password header (' + PASSWORD_HEADER + ')',
+    });
   }
+  outLastOk = Date.now();
+  notePoll(req);
+
   if (req.method === 'POST') {
     const bits = readInputBits(req);
     if (bits !== null) handleControlPins(bits);
@@ -530,7 +561,7 @@ app.route('/out').get(outHandler).post(outHandler);
 // Everything that sends something to the panel needs a verified key.
 function requireKey(res) {
   if (groqKey) return true;
-  res.status(401).json({ error: 'No Groq API key set yet. Paste your gsk_... key on the page first.' });
+  res.status(409).json({ error: 'No Groq API key set yet. Paste your gsk_... key on the page first.' });
   return false;
 }
 
@@ -882,6 +913,11 @@ app.get('/api/status', (_req, res) => {
     input: lastIn,
     action: lastAction,
     glyph: held !== null ? 'HELD (test)' : last.clear ? 'CLEAR SCREEN' : glyph(last.code),
+    auth: {
+      header: PASSWORD_HEADER,
+      transmitterRejected: outRejected,
+      transmitterLastOk: outLastOk,
+    },
   });
 });
 
@@ -915,17 +951,26 @@ const PAGE = `<!doctype html>
 </style>
 <h1>Panel Text</h1>
 
-<section id="keysec">
-  <h2>1. Groq API key (required)</h2>
+<section id="passsec" class="locked">
+  <h2>1. Panel password</h2>
+  <input id="pass" type="password" placeholder="Panel password" autocomplete="off">
+  <button onclick="unlock()">Unlock</button>
+  <button class="gray" onclick="lockPage()">Lock</button>
+  <small>This is the password your in-game HTTP Transmitter sends in the <b>${PASSWORD_HEADER}</b> header. The page itself is open, but nothing here works until you type it. It is remembered for this browser tab only.</small>
+  <div class="st" id="passst">locked</div>
+</section>
+
+<section id="keysec" class="locked">
+  <h2>2. Groq API key (required)</h2>
   <input id="key" type="password" placeholder="gsk_..." autocomplete="off">
   <button onclick="saveKey()">Save key</button>
   <button class="gray" onclick="forgetKey()">Forget key</button>
   <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart). Nothing below works until a working key is set.</small>
-  <div class="st" id="keyst">checking...</div>
+  <div class="st" id="keyst">locked</div>
 </section>
 
-<section id="chatsec">
-  <h2>2. Message</h2>
+<section id="chatsec" class="locked">
+  <h2>3. Message</h2>
   <input id="msg" type="text" placeholder="Say something..." autocomplete="off">
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
@@ -933,8 +978,8 @@ const PAGE = `<!doctype html>
   <div class="st" id="reply"></div>
 </section>
 
-<section id="promptsec">
-  <h2>3. AI prompt</h2>
+<section id="promptsec" class="locked">
+  <h2>4. AI prompt</h2>
   <textarea id="prompt" placeholder="Describe how the AI should behave..."></textarea>
   <label class="wrap"><input id="rules" type="checkbox" checked>Add the panel rules (one short line, only characters the panel can draw)</label>
   <button onclick="savePrompt()">Save prompt</button>
@@ -993,31 +1038,110 @@ const PAGE = `<!doctype html>
 <div class="st" id="st6"></div>
 <div class="st" id="st7"></div>
 <div class="st" id="st8"></div>
+<div class="st" id="st9"></div>
 
 <script>
   var H = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
+  var PASS_HEADER = '${PASSWORD_HEADER}';
+  var pass = '';
+  var passSet = false;
   var keySet = false;
   var sending = false;
 
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
+  function storedPass() { try { return sessionStorage.getItem('panelPass') || ''; } catch (e) { return ''; } }
+  function setStoredPass(p) {
+    try { if (p) sessionStorage.setItem('panelPass', p); else sessionStorage.removeItem('panelPass'); } catch (e) {}
+  }
+
+  // Headers for every request: the JSON bits plus the panel password.
+  function passHeaders() {
+    var h = {};
+    for (var k in H) h[k] = H[k];
+    if (pass) h[PASS_HEADER] = pass;
+    return h;
+  }
+
   async function post(path, body) {
-    var r = await fetch(path, { method: 'POST', headers: H, body: JSON.stringify(body || {}) });
+    var r = await fetch(path, { method: 'POST', headers: passHeaders(), body: JSON.stringify(body || {}) });
     var j = {};
     try { j = await r.json(); } catch (e) {}
+    if (r.status === 403 && j && j.locked) onLocked();
     refresh();
     return j;
   }
 
+  // Enable/disable everything from the two gates: password entered, key set.
+  function applyGates() {
+    var btns = document.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (b.closest('#passsec')) continue; // Unlock / Lock always usable
+      var needKey = b.classList.contains('needs-key');
+      b.disabled = !passSet || (needKey && !keySet);
+    }
+    document.getElementById('keysec').className = (passSet && keySet) ? '' : 'locked';
+    document.getElementById('chatsec').className = passSet ? '' : 'locked';
+    document.getElementById('promptsec').className = passSet ? '' : 'locked';
+    document.getElementById('passsec').className = passSet ? '' : 'locked';
+  }
+
   function applyKey(on) {
     keySet = !!on;
-    var btns = document.querySelectorAll('.needs-key');
-    for (var i = 0; i < btns.length; i++) btns[i].disabled = !keySet;
     var box = document.getElementById('keyst');
-    box.textContent = keySet ? 'Key set - the panel is unlocked.' : 'No key set - everything is locked.';
-    box.className = 'st ' + (keySet ? 'ok' : 'bad');
-    document.getElementById('keysec').className = keySet ? '' : 'locked';
+    box.textContent = !passSet ? 'locked (enter the panel password first)'
+      : (keySet ? 'Key set - the panel is unlocked.' : 'No key set - everything is locked.');
+    box.className = 'st ' + (keySet && passSet ? 'ok' : 'bad');
+    applyGates();
   }
+
+  function onLocked() {
+    pass = '';
+    setStoredPass('');
+    passSet = false;
+    keySet = false;
+    applyGates();
+    var box = document.getElementById('passst');
+    box.textContent = 'locked - enter the panel password';
+    box.className = 'st bad';
+    document.getElementById('keyst').textContent = 'locked (enter the panel password first)';
+    document.getElementById('keyst').className = 'st bad';
+    for (var i = 1; i <= 9; i++) {
+      var el = document.getElementById('st' + i);
+      if (el) el.textContent = '';
+    }
+  }
+
+  async function unlock() {
+    var el = document.getElementById('pass');
+    var box = document.getElementById('passst');
+    var p = el.value;
+    if (!p) { box.textContent = 'type the password'; box.className = 'st bad'; return; }
+    box.textContent = 'checking...';
+    box.className = 'st';
+    var h = {};
+    for (var k in H) h[k] = H[k];
+    h[PASS_HEADER] = p;
+    try {
+      var r = await fetch('/api/status', { headers: h });
+      if (r.status === 403) { box.textContent = 'wrong password'; box.className = 'st bad'; return; }
+      if (!r.ok) { box.textContent = 'error ' + r.status; box.className = 'st bad'; return; }
+      pass = p;
+      setStoredPass(p);
+      passSet = true;
+      el.value = '';
+      box.textContent = 'unlocked';
+      box.className = 'st ok';
+      applyGates();
+      refresh();
+    } catch (e) {
+      box.textContent = 'error: ' + e.message;
+      box.className = 'st bad';
+    }
+  }
+
+  function lockPage() { onLocked(); }
 
   async function saveKey() {
     var el = document.getElementById('key');
@@ -1026,8 +1150,9 @@ const PAGE = `<!doctype html>
     box.textContent = 'checking with Groq...';
     box.className = 'st';
     try {
-      var r = await fetch('/api/key', { method: 'POST', headers: H, body: JSON.stringify({ key: k }) });
+      var r = await fetch('/api/key', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ key: k }) });
       var j = await r.json();
+      if (r.status === 403 && j.locked) { onLocked(); return; }
       if (!r.ok) { box.textContent = j.error || 'key rejected'; box.className = 'st bad'; return; }
       el.value = '';
       box.textContent = j.message || 'key saved';
@@ -1053,8 +1178,10 @@ const PAGE = `<!doctype html>
   // Loaded once on page load (not on the 0.5 s refresh) so it never overwrites
   // what you are typing.
   async function loadPrompt() {
+    if (!passSet) return;
     try {
-      var r = await fetch('/api/prompt', { headers: H });
+      var r = await fetch('/api/prompt', { headers: passHeaders() });
+      if (!r.ok) return;
       var p = await r.json();
       document.getElementById('prompt').value = p.prompt;
       document.getElementById('rules').checked = p.appendRules;
@@ -1071,13 +1198,14 @@ const PAGE = `<!doctype html>
     try {
       var r = await fetch('/api/prompt', {
         method: 'POST',
-        headers: H,
+        headers: passHeaders(),
         body: JSON.stringify({
           prompt: document.getElementById('prompt').value,
           appendRules: document.getElementById('rules').checked
         })
       });
       var j = await r.json();
+      if (r.status === 403 && j.locked) { onLocked(); return; }
       if (!r.ok) { box.textContent = j.error || 'could not save'; box.className = 'st bad'; return; }
       box.textContent = j.message;
       box.className = 'st ok';
@@ -1099,21 +1227,22 @@ const PAGE = `<!doctype html>
     var box = document.getElementById('msg');
     var out = document.getElementById('reply');
     var msg = box.value.trim();
-    if (!msg || !keySet || sending) return;
+    if (!msg || !keySet || !passSet || sending) return;
     sending = true;
     var btn = document.getElementById('sendbtn');
     btn.disabled = true;
     out.textContent = 'thinking...';
     try {
-      var r = await fetch('/api/chat', { method: 'POST', headers: H, body: JSON.stringify({ message: msg }) });
+      var r = await fetch('/api/chat', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ message: msg }) });
       var j = await r.json();
-      if (!r.ok) out.textContent = 'error: ' + (j.error || r.status);
+      if (r.status === 403 && j.locked) onLocked();
+      else if (!r.ok) out.textContent = 'error: ' + (j.error || r.status);
       else { out.textContent = 'reply: ' + j.reply; box.value = ''; }
     } catch (e) {
       out.textContent = 'error: ' + e.message;
     }
     sending = false;
-    btn.disabled = !keySet;
+    applyGates();
     refresh();
   }
 
@@ -1123,10 +1252,15 @@ const PAGE = `<!doctype html>
   function hold() { post('/api/hold', { value: document.getElementById('hold').value }); }
 
   async function refresh() {
+    if (!passSet) return;
     try {
-      var r = await fetch('/api/status', { headers: H });
+      var r = await fetch('/api/status', { headers: passHeaders() });
+      if (r.status === 403) { onLocked(); return; }
+      if (!r.ok) return;
       var s = await r.json();
       applyKey(s.key);
+      document.getElementById('passst').textContent = 'unlocked';
+      document.getElementById('passst').className = 'st ok';
       document.getElementById('st1').textContent = 'model: ' + s.model + ' | prompt: ' + s.prompt + ' | queued frames: ' + s.queued;
       document.getElementById('st2').textContent = 'memory: ' + s.memory + ' / ' + s.memoryMax + ' turns';
       document.getElementById('st3').textContent = 'on the pins: code ' + s.code + ' = ' + s.glyph + ' (clear bit ' + s.clear + ')';
@@ -1136,13 +1270,21 @@ const PAGE = `<!doctype html>
       document.getElementById('st6').textContent = 'callers of /out: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
       document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' (pin 1 = interrupt, pin 2 = redo) | last action: ' + (s.action || 'none');
+      var ago = s.auth.transmitterLastOk === null ? 'never' : Math.round((Date.now() - s.auth.transmitterLastOk) / 1000) + ' s ago';
+      document.getElementById('st9').textContent = 'transmitter: header ' + s.auth.header + ' | last good poll: ' + ago + ' | rejected polls: ' + s.auth.transmitterRejected;
     } catch (e) {}
   }
 
   document.getElementById('msg').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') sendMsg();
   });
+  document.getElementById('pass').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') unlock();
+  });
 
+  pass = storedPass();
+  passSet = !!pass;
+  applyGates();
   loadPrompt();
   refresh();
   setInterval(refresh, 500);
@@ -1151,8 +1293,9 @@ const PAGE = `<!doctype html>
 app.get('/', (_req, res) => res.send(PAGE));
 
 app.listen(PORT, () => {
-  console.log('Panel page: http://localhost:' + PORT + '/ (password protected)');
-  console.log('Game transmitter path: /out' + (OUT_TOKEN ? '?token=...' : ' (open)'));
+  console.log('Panel page: http://localhost:' + PORT + '/ (open, but needs the panel password)');
+  console.log('Game transmitter path: /out (send header ' + PASSWORD_HEADER + ': <password>' + (OUT_TOKEN ? ', or ?token=...' : '') + ')');
+  console.log('Panel password: ' + (process.env.PANEL_PASSWORD ? 'from PANEL_PASSWORD.' : 'default "hi10h" - set PANEL_PASSWORD to change it.'));
   console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY.' : 'No Groq key yet - set one on the page.');
   console.log(customPrompt !== null ? 'Custom prompt loaded from PANEL_PROMPT.' : 'Using the default prompt (change it on the page).');
 });

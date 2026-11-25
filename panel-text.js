@@ -9,7 +9,7 @@
 //
 //   OS mode: a SIMULATED operating system (nothing real runs, it all happens in this
 //   script). The pins the transmitter POSTs are the keys of the machine:
-//        pin 1 = POWER   (on / off)
+//        pin 1 = I/O     (on / off; a switch: high = on, see OS_POWER_MODE)
 //        pin 2 = DOWN
 //        pin 3 = UP
 //        pin 4 = SELECT  (open / go back)
@@ -242,8 +242,9 @@ function makeTransmitter(password) {
     lastAction: '',
 
     // ---- mode: 'ai' (Groq text sender) or 'os' (simulated OS) ----
-    mode: 'ai',
+    mode: DEFAULT_MODE,
     os: makeOS(),
+    layout: { cols: OS_DEFAULT_COLS, rows: OS_DEFAULT_ROWS },
 
     // ---- conversation ----
     history: [],
@@ -460,14 +461,12 @@ function redoResponse(t) {
 // In AI mode pins 1-2 are INTERRUPT / REDO; in OS mode pins 1-6 are the OS keys.
 function handleControlPins(t, bits) {
   t.lastIn = bits;
-  if (t.prevIn !== null) {
+  if (t.mode === 'os') {
+    osPins(t, bits); // handles its own baseline, so it also sees the very first POST
+  } else if (t.prevIn !== null) {
     const rose = (i) => bits[i] === '1' && t.prevIn[i] === '0';
-    if (t.mode === 'os') {
-      OS_PINS.forEach((name, i) => { if (rose(i)) osKey(t, name); });
-    } else {
-      if (rose(PIN_INTERRUPT)) interruptResponse(t);
-      if (rose(PIN_REDO)) redoResponse(t);
-    }
+    if (rose(PIN_INTERRUPT)) interruptResponse(t);
+    if (rose(PIN_REDO)) redoResponse(t);
   }
   t.prevIn = bits; // first POST only sets the baseline, so a pin that is already high at start does nothing
 }
@@ -687,7 +686,8 @@ async function runChat(t, message, redo = false) {
 // like the AI mode does, so it works with the same panel wiring.
 //
 // KEYS (pins 1-6 of the value POSTed to /out, in OS mode)
-//   POWER  toggles the machine on/off (off = blank screen, state forgotten)
+//   I/O    (pin 1) switches the machine on/off (off = blank screen, state forgotten).
+//          Default: pin high = on, pin low = off. Set OS_POWER_MODE to 'toggle' for a push button.
 //   DOWN / UP / SELECT / FN1 / FN2: behaviour depends on the app, see below.
 //
 // HOME SCREEN   DOWN / UP move the highlight (the highlighted app is in CAPITALS),
@@ -709,10 +709,23 @@ async function runChat(t, message, redo = false) {
 // dice   UP/DOWN pick the die (d4 d6 d8 d10 d12 d20 d100), FN1/FN2 roll, SELECT = home.
 // info   UP/DOWN flip through pages (version, uptime, app count, last key). SELECT = home.
 
-// Screen size in characters. OS_COLS follows CHARS_PER_ROW. OS_ROWS is how many text rows
-// your panel shows: 2 is a guess for a 16x16 panel (6 px per row). Raise it if more fit.
-const OS_COLS = CHARS_PER_ROW || 4;
-const OS_ROWS = 2;
+// Layout. The panel writes characters left to right and wraps by itself, so the OS pads
+// every row out to the row width and each row of the screen starts on a fresh line.
+// That only looks right if the numbers match your panel:
+//   cols = characters per row, rows = rows of text on the screen.
+// Set the defaults here, or change them live in section 5 of the page ("Layout"), which
+// also has a grid test so you can count them. Every application sits on its own row.
+const OS_DEFAULT_COLS = CHARS_PER_ROW || 4;
+const OS_DEFAULT_ROWS = 4;
+
+// How the I/O (power) pin behaves:
+//   'level'  the pin is a switch: pin high = on, pin low = off
+//   'toggle' the pin is a push button: every press flips on/off
+const OS_POWER_MODE = 'level';
+
+// New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
+const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
+
 const OS_VERSION = '1.0';
 
 // Which input pin is which key (0 = first pin = leftmost bit of the posted value)
@@ -722,7 +735,6 @@ const TERM_LETTERS = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const TERM_MAX = 40;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 
-// Names are 4 letters so they fit the default 4-wide screen.
 const APPS = [
   { id: 'term', name: 'term' },
   { id: 'clok', name: 'clok' },
@@ -748,30 +760,37 @@ function makeOS() {
 const pad2 = (v) => String(v).padStart(2, '0');
 
 // Cut a string into chunks of one screen row
-function wrapRows(text, cols = OS_COLS) {
+function wrapRows(text, cols) {
   const s = String(text);
   const rows = [];
   for (let i = 0; i < s.length; i += cols) rows.push(s.slice(i, i + cols));
   return rows.length ? rows : [''];
 }
 
-// Lines of output -> pages of OS_ROWS rows (each line starts on a new row)
-function pagesFromLines(lines) {
-  const rows = [];
-  for (const line of lines) rows.push(...wrapRows(line));
+// Lines of output -> pages of "rows" rows (each line starts on a new row)
+function pagesFromLines(t, lines) {
+  const { cols, rows: perPage } = t.layout;
+  const all = [];
+  for (const line of lines) all.push(...wrapRows(line, cols));
   const pages = [];
-  for (let i = 0; i < rows.length; i += OS_ROWS) pages.push(rows.slice(i, i + OS_ROWS));
+  for (let i = 0; i < all.length; i += perPage) pages.push(all.slice(i, i + perPage));
   return pages.length ? pages : [['']];
 }
 
 // ---- Building the screen ----
 
-function homeRows(os) {
+// The home screen: one application per row, stacked. The selected one is marked with an
+// arrow when there is room for it (cols >= 5), otherwise it is written in CAPITALS.
+function homeRows(t) {
+  const { cols, rows } = t.layout;
+  const os = t.os;
   if (os.cursor < os.top) os.top = os.cursor;
-  if (os.cursor >= os.top + OS_ROWS) os.top = os.cursor - OS_ROWS + 1;
-  return APPS.slice(os.top, os.top + OS_ROWS).map((a, i) => {
-    const name = a.name.slice(0, OS_COLS);
-    return os.top + i === os.cursor ? name.toUpperCase() : name;
+  if (os.cursor >= os.top + rows) os.top = os.cursor - rows + 1;
+  return APPS.slice(os.top, os.top + rows).map((a, i) => {
+    const sel = os.top + i === os.cursor;
+    if (cols >= 5) return (sel ? '▶' : ' ') + a.name.slice(0, cols - 1);
+    const name = a.name.slice(0, cols);
+    return sel ? name.toUpperCase() : name;
   });
 }
 
@@ -786,18 +805,21 @@ function infoPages(os) {
 
 function osRows(t) {
   const os = t.os;
+  const { cols, rows } = t.layout;
   switch (os.app) {
     case 'home':
-      return homeRows(os);
+      return homeRows(t);
     case 'term': {
       const tm = os.term;
       if (tm.out) return tm.out[tm.page];
       const shown = tm.buf + (tm.pending ? tm.pending.toUpperCase() : '_');
-      return wrapRows(shown).slice(-OS_ROWS);
+      return wrapRows(shown, cols).slice(-rows);
     }
     case 'clok': {
       const d = new Date();
-      return [pad2(d.getHours()) + pad2(d.getMinutes()), pad2(d.getMonth() + 1) + pad2(d.getDate())];
+      return cols >= 5
+        ? [pad2(d.getHours()) + ':' + pad2(d.getMinutes()), pad2(d.getMonth() + 1) + '/' + pad2(d.getDate())]
+        : [pad2(d.getHours()) + pad2(d.getMinutes()), pad2(d.getMonth() + 1) + pad2(d.getDate())];
     }
     case 'dice':
       return ['d' + DICE_SIDES[os.dice.side], os.dice.result === null ? '-' : String(os.dice.result)];
@@ -808,21 +830,23 @@ function osRows(t) {
   }
 }
 
-// Row -> character codes. Rows are padded out to the row width so the next row starts at
-// the beginning of a fresh line on the panel (or NEWLINE_CODE is used if you have one).
-function osRowBreak(len) {
+// Row -> character codes. Every row except the last is padded out to the row width so the
+// next row starts at the beginning of a fresh line (or NEWLINE_CODE is used if you have one).
+function osRowBreak(t, len) {
   if (NEWLINE_CODE !== null) return [NEWLINE_CODE & 127];
-  const pad = len === 0 ? OS_COLS : (OS_COLS - (len % OS_COLS)) % OS_COLS;
+  const cols = t.layout.cols;
+  const pad = len === 0 ? cols : (cols - (len % cols)) % cols;
   return Array(pad).fill(SPACE_CODE);
 }
 
-function osCodes(rows) {
+function osCodes(t, rows) {
+  const { cols, rows: maxRows } = t.layout;
   const codes = [];
-  const shown = rows.slice(0, OS_ROWS);
+  const shown = rows.slice(0, maxRows);
   shown.forEach((row, i) => {
-    const chars = Array.from(row).slice(0, OS_COLS);
+    const chars = Array.from(row).slice(0, cols);
     codes.push(...chars.map(encode));
-    if (i < shown.length - 1) codes.push(...osRowBreak(chars.length));
+    if (i < shown.length - 1) codes.push(...osRowBreak(t, chars.length));
   });
   return codes;
 }
@@ -830,10 +854,10 @@ function osCodes(rows) {
 // Replace whatever is queued with: clear, then these rows. Pressing keys quickly just
 // restarts the drawing, so frames never pile up.
 function osDraw(t, rows) {
-  t.os.screen = rows.slice(0, OS_ROWS);
+  t.os.screen = rows.slice(0, t.layout.rows);
   t.queue = [];
   t.queue.push(...clearFrames());
-  const codes = osCodes(rows);
+  const codes = osCodes(t, rows);
   if (codes.length) t.queue.push(...buildFrames(t, codes));
 }
 
@@ -848,11 +872,11 @@ function osPower(t, on) {
   if (on) {
     t.os.power = true;
     t.os.bootedAt = Date.now();
-    t.queue.push(...buildFrames(t, osCodes(['boot'])));   // splash
+    t.queue.push(...buildFrames(t, osCodes(t, ['boot'])));   // splash
     const rows = osRows(t);
-    t.os.screen = rows.slice(0, OS_ROWS);
+    t.os.screen = rows.slice(0, t.layout.rows);
     t.queue.push(...clearFrames());
-    t.queue.push(...buildFrames(t, osCodes(rows)));       // home screen
+    t.queue.push(...buildFrames(t, osCodes(t, rows)));       // home screen
     noteAction(t, 'OS power ON');
   } else {
     noteAction(t, 'OS power OFF');
@@ -916,7 +940,7 @@ function runCommand(t) {
     default:
       out = ['err', cmd];
   }
-  tm.out = pagesFromLines(out);
+  tm.out = pagesFromLines(t, out);
   tm.page = 0;
 }
 
@@ -997,7 +1021,7 @@ function appKey(t, key) {
   // clok: any other key just redraws it
 }
 
-// One key press, from a pin (rising edge) or from the web page's test buttons.
+// One key press, from a pin or from the web page's test buttons.
 function osKey(t, key) {
   if (key === 'power') { osPower(t, !t.os.power); return; }
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (power off)'); return; }
@@ -1009,6 +1033,31 @@ function osKey(t, key) {
 
   if (t.os.power) osRefresh(t); // a command like "off" may have switched it off
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
+}
+
+// Input pins in OS mode. The I/O pin follows OS_POWER_MODE; the other five fire once on
+// their rising edge. The very first POST only sets the baseline for the five keys, but a
+// switch that is already ON at that moment still powers the OS up.
+function osPins(t, bits) {
+  const prev = t.prevIn;
+  const high = (b, i) => b[i] === '1';
+  if (OS_POWER_MODE === 'level') {
+    const on = high(bits, 0);
+    if (prev === null) { if (on && !t.os.power) osPower(t, true); }
+    else if (on !== high(prev, 0)) osPower(t, on);   // switch flipped
+  } else if (prev !== null && high(bits, 0) && !high(prev, 0)) {
+    osKey(t, 'power');
+  }
+  if (prev === null) return;
+  for (let i = 1; i < OS_PINS.length; i++) {
+    if (high(bits, i) && !high(prev, i)) osKey(t, OS_PINS[i]);
+  }
+}
+
+// Change the layout (characters per row, rows) and redraw.
+function setLayout(t, cols, rowCount) {
+  t.layout = { cols: Math.max(1, Math.min(64, cols | 0)), rows: Math.max(1, Math.min(16, rowCount | 0)) };
+  if (t.mode === 'os' && t.os.power) osRefresh(t);
 }
 
 // ======================= API FOR THE WEB PAGE =======================
@@ -1129,10 +1178,30 @@ app.post('/api/os/mode', (req, res) => {
   abandonChat(t);
   t.mode = mode;
   t.queue = [];
-  if (mode === 'os' && t.os.power) osRefresh(t);
+  // an I/O switch that is already on when you enter OS mode powers it up
+  if (mode === 'os' && OS_POWER_MODE === 'level' && t.lastIn && t.lastIn[0] === '1' && !t.os.power) osPower(t, true);
+  else if (mode === 'os' && t.os.power) osRefresh(t);
   else t.queue.push(...clearFrames());
   noteAction(t, 'mode: ' + mode);
   res.json({ ok: true, mode });
+});
+
+// Set characters per row / rows of text for this transmitter's OS screen.
+app.post('/api/os/layout', (req, res) => {
+  const t = req.transmitter;
+  setLayout(t, Number(req.body.cols), Number(req.body.rows));
+  res.json({ ok: true, layout: t.layout });
+});
+
+// Grid test: sends 60 digits (1234567890 six times) so you can count how many fit on a row.
+app.post('/api/os/grid', (req, res) => {
+  const t = req.transmitter;
+  t.queue = [];
+  t.queue.push(...clearFrames());
+  const codes = Array.from('1234567890'.repeat(6)).map(encode);
+  t.queue.push(...buildFrames(t, codes));
+  noteAction(t, 'grid test');
+  res.json({ ok: true, queued: t.queue.length });
 });
 
 // Press an OS key from the page (same as the matching pin from the game).
@@ -1209,6 +1278,8 @@ app.get('/api/status', (req, res) => {
     key: !!groqKey,
     mode: t.mode,
     os: { power: t.os.power, app: t.os.app, screen: t.os.screen, lastKey: t.os.lastKey },
+    layout: t.layout,
+    powerMode: OS_POWER_MODE,
     model: GROQ_MODEL,
     prompt: t.customPrompt !== null ? 'custom' : 'default',
     memory: t.history.length / 2,
@@ -1314,7 +1385,7 @@ const PAGE = `<!doctype html>
   <h2>5. Simulated OS (same password)</h2>
   <div class="st" id="osmode">mode: AI text sender</div>
   <button id="osmodebtn" onclick="toggleOsMode()">Switch to OS mode</button>
-  <small>In OS mode the pins the game POSTs become keys: pin 1 power, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The AI chat is paused until you switch back. No Groq key needed.</small>
+  <small>In OS mode the pins the game POSTs become keys: pin 1 I/O (on/off), 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The AI chat is paused until you switch back. No Groq key needed.</small>
   <pre class="screen" id="osscreen">(AI mode)</pre>
   <div class="keys">
     <button onclick="osKey('power')">Power (1)</button>
@@ -1325,6 +1396,12 @@ const PAGE = `<!doctype html>
     <button onclick="osKey('fn2')">FN2 (6)</button>
   </div>
   <div class="st" id="osst"></div>
+  <div class="st">Layout (must match your panel):</div>
+  <label>chars per row <input id="lcols" type="number" min="1" max="64" value="4"></label>
+  <label>rows <input id="lrows" type="number" min="1" max="16" value="4"></label>
+  <button onclick="saveLayout()">Save layout</button>
+  <button class="gray" onclick="post('/api/os/grid')">Grid test</button><br>
+  <small>Grid test writes 1234567890 six times: count how many digits sit on the first row and how many rows appear, then enter those numbers. Every app is on its own row, padded to this width.</small><br>
   <small>Home: up/down move, select opens (highlighted app is in CAPITALS). term: FN1 scrolls letters, up accepts the letter, FN2 = space, select = back/delete, down = run (try: help). Apps: term, clok, dice, info.</small>
 </section>
 
@@ -1388,6 +1465,7 @@ const PAGE = `<!doctype html>
   var keySet = false;
   var sending = false;
   var osMode = 'ai';
+  var layoutLoaded = false;
 
   function num(id) { return parseInt(document.getElementById(id).value, 10) || 0; }
 
@@ -1450,6 +1528,7 @@ const PAGE = `<!doctype html>
     if (p.length > 200) { box.textContent = 'password too long (max 200)'; box.className = 'st bad'; return; }
     pass = p;
     passSet = true;
+    layoutLoaded = false;
     setStoredPass(p);
     el.value = '';
     renderDict();
@@ -1464,6 +1543,7 @@ const PAGE = `<!doctype html>
     pass = '';
     passSet = false;
     keySet = false;
+    layoutLoaded = false;
     setStoredPass('');
     document.getElementById('dict').value = '';
     document.getElementById('pass').value = '';
@@ -1542,6 +1622,11 @@ const PAGE = `<!doctype html>
   }
 
   // ---- Simulated OS ----
+  async function saveLayout() {
+    await post('/api/os/layout', { cols: num('lcols'), rows: num('lrows') });
+    layoutLoaded = true;
+  }
+
   async function toggleOsMode() {
     await post('/api/os/mode', { mode: osMode === 'os' ? 'ai' : 'os' });
   }
@@ -1643,8 +1728,13 @@ const PAGE = `<!doctype html>
       applyKey(s.key);
 
       osMode = s.mode;
+      if (!layoutLoaded && s.layout) {
+        document.getElementById('lcols').value = s.layout.cols;
+        document.getElementById('lrows').value = s.layout.rows;
+        layoutLoaded = true;
+      }
       document.getElementById('osmode').textContent = s.mode === 'os'
-        ? 'mode: simulated OS (pins 1-6 are keys) | power: ' + (s.os.power ? 'on, app: ' + s.os.app : 'off')
+        ? 'mode: simulated OS (pins 1-6 are keys) | I/O: ' + (s.os.power ? 'on, app: ' + s.os.app : 'off')
         : 'mode: AI text sender (pins 1-2 are interrupt / redo)';
       document.getElementById('osmodebtn').textContent = s.mode === 'os' ? 'Switch back to AI mode' : 'Switch to OS mode';
       var scr = document.getElementById('osscreen');

@@ -56,11 +56,10 @@
 // The FIRST characters of what you send are the input pins (first pin = leftmost).
 //   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
 //   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
-// AI controls act on rising edges. OS controls act on a changed pin state; the per-key
-// debounce filters the release of an ordinary short press, while allowing latching
-// switches to trigger on both positions. A request with no input value is output-only
-// and does not change the remembered inputs. If buttons read 0 when pressed, set
-// PINS_ACTIVE_LOW = true below.
+// All momentary controls act only on a rising edge (0 -> 1). Button releases do NOT
+// trigger a second action. Only the power pin can optionally use its falling edge for
+// a latching switch. A request with no input value is output-only and does not change
+// the remembered inputs. If buttons read 0 when pressed, set PINS_ACTIVE_LOW = true.
 //
 // The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
 // by all transmitters on this server. The rest of the simulated OS does NOT need a key.
@@ -491,8 +490,8 @@ function redoResponse(t) {
   });
 }
 
-// AI mode controls fire on rising edges. OS mode accepts either input transition,
-// which supports latching transmitter switches as well as momentary buttons.
+// AI and OS controls use rising edges. OS mode can optionally use the power pin's
+// falling edge for a latching power switch; ordinary button releases are ignored.
 function handleControlPins(t, bits) {
   t.lastIn = bits;
   let osActionHandled = false;
@@ -771,10 +770,9 @@ async function runOsChat(t, message) {
 // Every handled key press clears the panel first, then the current line is written
 // (even if the text did not change), so no leftovers can survive a button press.
 //
-// KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires when its
-// input state changes. A short per-key debounce ignores the release edge of a quick
-// momentary press and filters switch bounce. Latching switches can trigger on both
-// transitions, so they can be used as transmitter buttons too.
+// KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires only on
+// its rising edge (0 -> 1), so releasing a button never repeats the action. The power
+// pin may optionally use its falling edge for a latching switch (see setting below).
 //   pin 1  I/O     on / off. Off = blank screen until you press it again.
 //   pin 2  DOWN
 //   pin 3  UP
@@ -800,11 +798,12 @@ const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai'
 
 const OS_VERSION = '1.0';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
-const OS_DEBOUNCE_MS = 350;  // filters a momentary button's release edge and switch bounce
+const OS_DEBOUNCE_MS = 100;  // filters electrical bounce without blocking normal quick presses
 
-// OS transmitter inputs accept either transition. This supports both latching
-// switches (on/off transitions) and momentary buttons (the release transition is
-// ignored by OS_DEBOUNCE_MS when it follows the press quickly).
+// Leave false for ordinary momentary buttons: each press is 0 -> 1 and release is ignored.
+// Set true ONLY when the power input is a latching switch that stays high until toggled
+// again; then its falling edge also toggles power. Do not enable for a momentary button.
+const POWER_ON_FALLING_EDGE = false;
 
 const APPS = [
   { id: 'ai', name: 'ai chat' },
@@ -1049,15 +1048,28 @@ function osKey(t, key) {
 // still produces one action. A GET /out with no value does not change this baseline.
 function osPins(t, bits) {
   const prev = t.prevIn || '00000000';
-  let handled = false;
+  const pressed = [];
 
+  // Only a rising edge is a normal button press. In particular, a falling edge on
+  // DOWN/UP/SELECT/FN1/FN2 must never be interpreted as another key press.
   for (let i = 0; i < OS_PINS.length; i++) {
     const name = OS_PINS[i];
-    const changed = bits[i] !== prev[i];
-    if (changed && osKey(t, name)) handled = true;
+    const rose = bits[i] === '1' && prev[i] === '0';
+    const powerFell = name === 'power' && POWER_ON_FALLING_EDGE &&
+      bits[i] === '0' && prev[i] === '1';
+
+    if (rose || powerFell) pressed.push(name);
   }
 
-  return handled;
+  // A single input snapshot should represent one button. If the transmitter reports
+  // POWER and another key together, reject the chord instead of performing both.
+  if (pressed.length > 1) {
+    noteAction(t, 'OS ignored simultaneous buttons: ' + pressed.join(' + '));
+    return false;
+  }
+
+  if (pressed.length === 1) return osKey(t, pressed[0]);
+  return false;
 }
 
 // ======================= API FOR THE WEB PAGE =======================

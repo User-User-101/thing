@@ -58,8 +58,8 @@
 //   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
 // All momentary controls act only on a rising edge (0 -> 1). Button releases do NOT
 // trigger a second action. Only the power pin can optionally use its falling edge for
-// a latching switch. A request with no input value is output-only and does not change
-// the remembered inputs. If buttons read 0 when pressed, set PINS_ACTIVE_LOW = true.
+// a latching switch. A request with no input value re-arms the controls as released
+// without triggering them. If buttons read 0 when pressed, set PINS_ACTIVE_LOW = true.
 //
 // The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
 // by all transmitters on this server. The rest of the simulated OS does NOT need a key.
@@ -70,6 +70,8 @@
 //   S      = shift pin
 //   C5..C0 = the 6 character pins
 // Example: 'A' = 01000001, 'a' = 00000001, clear screen = 10000000, idle = 00000000.
+
+// BUTTON INPUT FIX v5: input-free polls re-arm the keys without creating a press.
 
 const express = require('express');
 
@@ -530,11 +532,20 @@ function outHandler(req, res) {
   if (!rawSent && req.query.value !== undefined) rawSent = '?value=' + String(req.query.value);
   t.lastRaw = rawSent;
 
-  // Process input only when this request actually contains a pin snapshot.
-  // A GET /out with no value is an output poll, NOT proof that every input is low.
-  // Keeping the last known snapshot lets latching switches report their falling edge.
+  // Read the current transmitter input snapshot.
   const bits = readInputBits(req);
-  const osButtonHandled = bits === null ? false : handleControlPins(t, bits);
+  let osButtonHandled = false;
+
+  if (bits !== null) {
+    osButtonHandled = handleControlPins(t, bits);
+  } else {
+    // A poll with no input payload is the transmitter's released/idle state.
+    // Reset only the edge-detection baseline: do NOT call osKey and do NOT
+    // interpret this as a falling-edge press. This re-arms every key so the same
+    // physical button can be pressed again on the next POST.
+    t.prevIn = '00000000';
+    t.lastIn = '00000000';
+  }
 
   if (t.held !== null) return res.json({ value: t.held });
 
@@ -798,7 +809,7 @@ const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai'
 
 const OS_VERSION = '1.0';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
-const OS_DEBOUNCE_MS = 100;  // filters electrical bounce without blocking normal quick presses
+const OS_DEBOUNCE_MS = 40;   // short bounce filter; edge detection prevents held-button repeats
 
 // Leave false for ordinary momentary buttons: each press is 0 -> 1 and release is ignored.
 // Set true ONLY when the power input is a latching switch that stays high until toggled
@@ -1041,11 +1052,9 @@ function osKey(t, key) {
   return true;
 }
 
-// Input pins in OS mode. A state change on either edge is a button action.
-// This is important for latching/toggle-style transmitter controls: one click may
-// change 0 -> 1 and the next click may change 1 -> 0. For momentary buttons, the
-// release edge usually arrives within OS_DEBOUNCE_MS and is ignored, so one press
-// still produces one action. A GET /out with no value does not change this baseline.
+// Input pins in OS mode. Only rising edges activate a button. A poll without an
+// input payload resets the baseline to released in outHandler, so the same button
+// can be pressed again even when the transmitter sends input only on press events.
 function osPins(t, bits) {
   const prev = t.prevIn || '00000000';
   const pressed = [];

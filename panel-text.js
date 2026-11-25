@@ -12,7 +12,8 @@
 //   /keys/3  pins 1-8 = Q R S T U V W X
 //   /keys/4  pin 1 = Y, pin 2 = Z, pin 3 = ENTER (pins 4-8 unused)
 // Each key is an independent input pin. Send the current 8-pin state in a POST body,
-// e.g. {"value":"10000000"}; also POST the released 0 state before pressing it again.
+// e.g. {"value":"10000000"}; arrays and bare bit strings are also accepted.
+// Bank endpoints answer HTTP 200 JSON for compatibility and never return display frames.
 // The server reacts only to 0 -> 1 transitions.
 // All four keyboard transmitters use the SAME pass header as the display transmitter,
 // so every key controls that panel's currently open OS application. Their responses
@@ -216,6 +217,7 @@ function makeTransmitter(password) {
     keyBankPrev: new Map(),       // POST-only auxiliary keyboard banks
     directKeyPrev: new Map(),     // optional one-endpoint-per-key inputs
     lastKeyboardKey: '',
+    lastKeyboardRequest: null,
     lastRaw: '',                     // what the game sent, for diagnostics
     lastAction: '',
 
@@ -383,59 +385,81 @@ function noteSent(t, frame) {
 
 // ---- Input pins ----
 
-// Pull the 8-bit string out of the request. Accepts {"value":"00000000"} as a JSON
-// body (whatever the Content-Type), a bare 8-bit body, or ?value=... in the URL.
+// Read a keyboard pin snapshot from Build Logic's different possible POST formats.
+// Accepted examples: {"value":"10000000"}, bare 10000000, value=10000000,
+// [1,0,0,0,0,0,0,0], {"pin1":1,...}, and JSON numeric bitmasks 0..255.
 function readInputBits(req) {
-  let v;
+  let value;
   const raw = req.body;
   const pick = (obj) => {
     if (!obj || typeof obj !== 'object') return undefined;
-    return obj.value ?? obj.bits ?? obj.input ?? obj.pins;
+    if (Array.isArray(obj)) return obj;
+    const direct = obj.value ?? obj.bits ?? obj.input ?? obj.pins ?? obj.state ?? obj.outputs;
+    if (direct !== undefined) return direct;
+    const pinKeys = ['pin1','pin2','pin3','pin4','pin5','pin6','pin7','pin8'];
+    if (pinKeys.some(k => obj[k] !== undefined)) return pinKeys.map(k => obj[k] ?? 0);
+    const numericKeys = ['1','2','3','4','5','6','7','8'];
+    if (numericKeys.some(k => obj[k] !== undefined)) return numericKeys.map(k => obj[k] ?? 0);
+    return undefined;
   };
 
   if (raw && typeof raw === 'object') {
-    v = pick(raw);
+    value = pick(raw);
   } else if (typeof raw === 'string' && raw.trim()) {
     const body = raw.trim();
     try {
       const parsed = JSON.parse(body);
-      v = parsed && typeof parsed === 'object' ? pick(parsed) : parsed;
-    } catch (e) {
-      // Build Logic may POST form data (value=...) or a bare bit string.
+      value = (parsed && typeof parsed === 'object') ? pick(parsed) : parsed;
+    } catch (_) {
+      // Form body, comma/space-separated pins, or a literal bit string.
       try {
         const params = new URLSearchParams(body);
-        v = params.get('value') ?? params.get('bits') ?? params.get('input') ?? params.get('pins');
+        value = params.get('value') ?? params.get('bits') ?? params.get('input') ?? params.get('pins') ?? params.get('state');
       } catch (_) {}
-      if (v === undefined || v === null) {
-        const named = body.match(/(?:value|bits|input|pins)\s*[:=]\s*[\"']?([01]{1,8})/i);
-        if (named) v = named[1];
-        else if (/^[01]{1,8}$/.test(body)) v = body;
+      if (value === undefined || value === null) {
+        const named = body.match(/(?:value|bits|input|pins|state)\s*[:=]\s*[\"']?([01]{1,8})/i);
+        if (named) value = named[1];
+        else if (/^[01]{1,8}$/.test(body)) value = body;
+        else if (/^[01](?:[\s,;]+[01]){1,7}$/.test(body)) value = body.split(/[\s,;]+/);
         else {
-          const embedded = body.match(/(?:^|[^0-9])([01]{6,8})(?:$|[^0-9])/);
-          v = embedded ? embedded[1] : undefined;
+          const embedded = body.match(/(?:^|[^0-9])([01]{8})(?:$|[^0-9])/);
+          if (embedded) value = embedded[1];
         }
       }
     }
   }
 
-  if (v === undefined || v === null) {
-    v = req.query.value ?? req.query.bits ?? req.query.input ?? req.query.pins;
+  if (value === undefined || value === null) {
+    value = req.query.value ?? req.query.bits ?? req.query.input ?? req.query.pins ?? req.query.state;
   }
-  if (v === undefined || v === null) return null;
+  if (value === undefined || value === null) return null;
 
-  let s;
-  // If the transmitter sends a JSON number, interpret it as an 8-bit value.
-  if (typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= 255) {
-    s = v.toString(2).padStart(8, '0');
+  let bits;
+  if (Array.isArray(value)) {
+    if (value.length < 1 || value.length > 8) return null;
+    const pinValues = value.map(v => {
+      if (v === true || v === 1 || v === '1' || String(v).toLowerCase() === 'true' || String(v).toLowerCase() === 'on') return '1';
+      if (v === false || v === 0 || v === '0' || v === null || v === undefined || String(v).toLowerCase() === 'false' || String(v).toLowerCase() === 'off') return '0';
+      return '?';
+    });
+    if (pinValues.includes('?')) return null;
+    bits = pinValues.join('').padEnd(8, '0');
+  } else if (typeof value === 'object' && value !== null) {
+    return null;
+  } else if (typeof value === 'boolean') {
+    bits = (value ? '1' : '0') + '0000000';
+  } else if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= 255) {
+    bits = value.toString(2).padStart(8, '0');
   } else {
-    s = String(v).trim();
-    if (!/^[01]{1,8}$/.test(s)) return null;
-    // Text bit strings are left-to-right pin states (pin 1 is the first bit).
-    s = s.padEnd(8, '0');
+    const str = String(value).trim();
+    if (/^[01]{1,8}$/.test(str)) bits = str.padEnd(8, '0');
+    else if (/^[01](?:[\s,;]+[01]){1,7}$/.test(str)) bits = str.split(/[\s,;]+/).join('').padEnd(8, '0');
+    else if (/^(?:0|[1-9]\d{0,2})$/.test(str) && Number(str) <= 255) bits = Number(str).toString(2).padStart(8, '0');
+    else return null;
   }
 
-  if (PINS_ACTIVE_LOW) s = s.replace(/[01]/g, (b) => (b === '0' ? '1' : '0'));
-  return REVERSE_BITS ? s.split('').reverse().join('') : s;
+  if (PINS_ACTIVE_LOW) bits = bits.replace(/[01]/g, b => b === '0' ? '1' : '0');
+  return REVERSE_BITS ? bits.split('').reverse().join('') : bits;
 }
 
 function noteAction(t, text) {
@@ -1263,9 +1287,28 @@ function handleKeyboardEndpoint(req, res, routeName) {
 
   if (bank) {
     const bits = readInputBits(req);
+    const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? null);
+    t.lastKeyboardRequest = {
+      endpoint: '/keys/' + bank.id,
+      method: req.method,
+      contentType: req.headers['content-type'] || '(none)',
+      rawBody: String(rawBody || '').slice(0, 300),
+      query: req.originalUrl.includes('?') ? req.originalUrl.split('?').slice(1).join('?') : '',
+      parsedBits: bits,
+      receivedAt: new Date().toISOString(),
+    };
+    console.log('[keyboard ' + bank.id + '] ' + JSON.stringify(t.lastKeyboardRequest));
+
+    // Return HTTP 200 (not 204) for broad compatibility with game transmitters.
+    // Invalid/missing input is reported in JSON and Render logs instead of a bare HTTP 400.
     if (bits === null) {
-      return res.status(400).json({
-        error: 'Missing/invalid pin state. Send an 8-bit value, e.g. {"value":"10000000"}.'
+      noteAction(t, 'keyboard bank ' + bank.id + ' received unrecognized input format');
+      return res.status(200).json({
+        ok: false,
+        endpoint: '/keys/' + bank.id,
+        error: 'Could not read the POST body as pin states.',
+        expected: '{\"value\":\"10000000\"} or bare 10000000 or [1,0,0,0,0,0,0,0]',
+        received: t.lastKeyboardRequest,
       });
     }
 
@@ -1281,7 +1324,7 @@ function handleKeyboardEndpoint(req, res, routeName) {
     } else if (rising.length === 1) {
       dispatchKeyboardKey(t, rising[0]);
     }
-    return res.status(204).end();
+    return res.status(200).json({ ok: true, accepted: true, endpoint: '/keys/' + bank.id, bits, pressed: rising });
   }
 
   // Also support /keys/a, /keys/b, ... /keys/z, /keys/enter as aliases.
@@ -1552,6 +1595,8 @@ app.get('/api/status', (req, res) => {
     clear: t.last.clear,
     value: t.held !== null ? t.held : toValue(t.last),
     input: t.lastIn,
+    keyboard: t.lastKeyboardRequest,
+    lastKeyboardKey: t.lastKeyboardKey,
     raw: t.lastRaw || '',
     action: t.lastAction,
     glyph: t.held !== null ? 'HELD (test)' : t.last.clear ? 'CLEAR SCREEN' : glyph(t.last.code),
@@ -2010,8 +2055,9 @@ const PAGE = `<!doctype html>
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
       document.getElementById('st6').textContent = 'display pollers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
-      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)')
+      document.getElementById('st8').textContent = 'display input: ' + (s.input || '(nothing yet)')
         + ' | raw: ' + (s.raw ? JSON.stringify(s.raw) : '(no body)')
+        + ' | keyboard: ' + (s.keyboard ? s.keyboard.endpoint + ' ' + s.keyboard.method + ' body=' + s.keyboard.rawBody + ' parsed=' + s.keyboard.parsedBits : '(no keyboard request yet)')
         + ' | last action: ' + (s.action || 'none');
       document.getElementById('st9').textContent = 'transmitters on this server: ' + tr.count + ' | this one created ' + new Date(tr.createdAt).toLocaleString();
     } catch (e) {}

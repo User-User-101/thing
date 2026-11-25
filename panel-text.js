@@ -415,13 +415,17 @@ function readInputBits(req) {
   let v;
   const raw = req.body;
   if (raw && typeof raw === 'object') {
-    v = raw.value;
+    // Accept common transmitter payload variants.
+    v = raw.value ?? raw.bits ?? raw.input ?? raw.pins;
   } else if (typeof raw === 'string' && raw.trim()) {
+    const body = raw.trim();
     try {
-      const j = JSON.parse(raw);
-      v = j && typeof j === 'object' ? j.value : j;
+      const j = JSON.parse(body);
+      if (j && typeof j === 'object') v = j.value ?? j.bits ?? j.input ?? j.pins;
+      else v = j;
     } catch (e) {
-      const m = raw.match(/[01]{8}/);
+      // Accept a bare bit string, or find an 8-bit value in other POST text.
+      const m = body.match(/[01]{8}/);
       v = m ? m[0] : undefined;
     }
   }
@@ -429,8 +433,10 @@ function readInputBits(req) {
   if (v === undefined || v === null) return null;
 
   let s = String(v).trim();
+  // Some transmitters send a numeric value rather than a string of bits.
   if (!/^[01]+$/.test(s)) return null;
-  s = s.padEnd(8, '0').slice(0, 8); // first character = first pin
+  // Keep the leftmost six OS-control pins; normalize shorter payloads too.
+  s = s.padEnd(8, '0').slice(0, 8);
   if (PINS_ACTIVE_LOW) s = s.replace(/[01]/g, (b) => (b === '0' ? '1' : '0'));
   return REVERSE_BITS ? s.split('').reverse().join('') : s;
 }
@@ -997,12 +1003,15 @@ function osKey(t, key) {
 // after start / after a mode switch counts as a press for any pin that is already high,
 // so the physical buttons behave like the web page buttons (which fire on every click).
 function osPins(t, bits) {
+  // POST input is a button-state snapshot. Treat a 0->1 transition as a click,
+  // just like the browser's /api/os/key buttons; holding a button won't repeat.
   const prev = t.prevIn || '00000000';
-  OS_PINS.forEach((name, i) => {
-    const up = bits[i] === '1' && prev[i] === '0';
-    const down = bits[i] === '0' && prev[i] === '1';
-    if (up || (name === 'power' && POWER_ON_FALLING_EDGE && down)) osKey(t, name);
-  });
+  for (let i = 0; i < OS_PINS.length; i++) {
+    const name = OS_PINS[i];
+    const rose = bits[i] === '1' && prev[i] === '0';
+    const fell = bits[i] === '0' && prev[i] === '1';
+    if (rose || (name === 'power' && POWER_ON_FALLING_EDGE && fell)) osKey(t, name);
+  }
 }
 
 // ======================= API FOR THE WEB PAGE =======================
@@ -1178,7 +1187,9 @@ app.post('/api/clear', (req, res) => {
   if (!requireKey(res)) return;
   t.lastUserMessage = ''; // REDO does nothing until a new message is sent
   abandonChat(t);
-  t.queue.push(...clearFrames());
+  // A clear command must replace pending output, not wait behind it.
+  t.queue = clearFrames();
+  t.held = null;
   res.json({ queued: t.queue.length });
 });
 

@@ -1268,7 +1268,7 @@ const PAGE = `<!doctype html>
       document.getElementById('prompt').value = p.prompt;
       document.getElementById('rules').checked = p.appendRules;
       var box = document.getElementById('promptst');
-      box.textContent = p.custom ? 'Using this transmitter\'s custom prompt.' : 'Using the default prompt.';
+      box.textContent = p.custom ? 'Using the custom prompt for this transmitter.' : 'Using the default prompt.';
       box.className = 'st';
     } catch (e) {}
   }
@@ -1341,11 +1341,11 @@ const PAGE = `<!doctype html>
       var box = document.getElementById('passst');
       var tr = s.transmitter;
       if (tr.lastPollAgoMs === null) {
-        box.textContent = 'connected — the game has not polled with this password yet';
+        box.textContent = 'connected - the game has not polled with this password yet';
         box.className = 'st bad';
       } else {
         var sec = Math.round(tr.lastPollAgoMs / 1000);
-        box.textContent = 'connected — game last polled ' + (sec < 1 ? 'just now' : sec + ' s ago');
+        box.textContent = 'connected - game last polled ' + (sec < 1 ? 'just now' : sec + ' s ago');
         box.className = 'st ok';
       }
       document.getElementById('st1').textContent = 'model: ' + s.model + ' | prompt: ' + s.prompt + ' | queued frames: ' + s.queued;

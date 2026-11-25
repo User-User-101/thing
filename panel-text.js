@@ -49,15 +49,16 @@
 // MULTIPLE TRANSMITTERS: every different password is a separate panel. Each has its
 // own frame queue, conversation, prompt, OS state and diagnostics.
 //
-// HTTP Transmitter in POST mode: the transmitter POSTs its own pin state to /out as
-//   {"value":"00000000"}
-// (with the pass header) and the server answers with the next panel frame, also as
-//   {"value":"........"}. 
-// The FIRST characters of what you POST are the input pins (first pin = leftmost).
+// HTTP Transmitter: the transmitter sends its own pin state to /out, either POSTed in
+// the body as {"value":"00000000"} or on a GET as /out?value=00000000 (with the pass
+// header), and the server answers with the next panel frame, also as
+//   {"value":"........"}.
+// The FIRST characters of what you send are the input pins (first pin = leftmost).
 //   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
 //   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
 // All of them act once on the rising edge (0 -> 1), so holding a pin high does not
-// repeat. Pins that are not used are ignored. GET /out also works (no inputs).
+// repeat. Pins that are not used are ignored. GET /out without a value also works (no
+// inputs). If your buttons read 0 when pressed, set PINS_ACTIVE_LOW = true below.
 //
 // The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
 // by all transmitters on this server. The rest of the simulated OS does NOT need a key.
@@ -163,6 +164,10 @@ const SPACE_CODE = 63;
 // Flip if the game reads the 8-bit string in the opposite direction
 const REVERSE_BITS = false;
 
+// Set true if a PRESSED button reads as 0 instead of 1 (active-low wiring). The pins
+// are inverted after padding, so a press still shows up as a 0 -> 1 rising edge.
+const PINS_ACTIVE_LOW = false;
+
 // ---- AI-mode control pins, read from the value the transmitter POSTs to /out ----
 const PIN_INTERRUPT = 0;
 const PIN_REDO = 1;
@@ -237,6 +242,7 @@ function makeTransmitter(password) {
     // ---- input (pins) ----
     prevIn: null,
     lastIn: null,
+    lastRaw: '',                     // what the game sent, for diagnostics
     lastAction: '',
 
     // ---- mode: 'ai' (Groq text sender) or 'os' (simulated OS) ----
@@ -425,6 +431,7 @@ function readInputBits(req) {
   let s = String(v).trim();
   if (!/^[01]+$/.test(s)) return null;
   s = s.padEnd(8, '0').slice(0, 8); // first character = first pin
+  if (PINS_ACTIVE_LOW) s = s.replace(/[01]/g, (b) => (b === '0' ? '1' : '0'));
   return REVERSE_BITS ? s.split('').reverse().join('') : s;
 }
 
@@ -470,8 +477,8 @@ function handleControlPins(t, bits) {
   t.prevIn = bits;
 }
 
-// The game calls this. The pass header chooses the transmitter. GET = plain poll.
-// POST = the transmitter's pin state comes in the body and is handled first.
+// The game calls this. The pass header chooses the transmitter. Pins can come from a
+// POST body or from ?value= on a GET; either way they are handled first.
 function outHandler(req, res) {
   const password = givenPassword(req);
   if (!password) {
@@ -485,10 +492,17 @@ function outHandler(req, res) {
   t.lastPollAt = Date.now();
   notePoll(t, req);
 
-  if (req.method === 'POST') {
-    const bits = readInputBits(req);
-    if (bits !== null) handleControlPins(t, bits);
-  }
+  // Remember what the game sent, for the diagnostics on the page.
+  let rawSent = '';
+  if (typeof req.body === 'string') rawSent = req.body;
+  else if (req.body && typeof req.body === 'object') rawSent = JSON.stringify(req.body);
+  if (!rawSent && req.query.value !== undefined) rawSent = '?value=' + String(req.query.value);
+  t.lastRaw = rawSent;
+
+  // Pins work on GET as well as POST now.
+  const bits = readInputBits(req);
+  if (bits !== null) handleControlPins(t, bits);
+
   if (t.held !== null) return res.json({ value: t.held });
   const frame = t.queue.length ? t.queue.shift() : blank(); // empty: always 00000000
   t.last = frame;
@@ -710,7 +724,8 @@ async function runOsChat(t, message) {
 // (even if the text did not change), so no leftovers can survive a button press.
 //
 // KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires once, when its
-// pin goes from 0 to 1, with a short debounce so button bounce cannot double-fire.
+// pin goes from 0 to 1, with a short debounce so button bounce cannot double-fire. The
+// power key is the exception: it is a toggle and always responds.
 //   pin 1  I/O     on / off. Off = blank screen until you press it again.
 //   pin 2  DOWN
 //   pin 3  UP
@@ -737,6 +752,12 @@ const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai'
 const OS_VERSION = '1.0';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
 const OS_DEBOUNCE_MS = 150;   // ignore the same key pressed again within this window
+
+// Set true only if your in-game power control is a latching toggle that stays high
+// while the OS is on. Then the power key also fires on the falling edge (high -> low),
+// so the same switch can turn the OS off again. Leave false for a momentary button:
+// with a momentary button, the falling edge would toggle power a second time.
+const POWER_ON_FALLING_EDGE = false;
 
 const APPS = [
   { id: 'ai', name: 'ai chat' },
@@ -943,24 +964,30 @@ function appKey(t, key) {
 // One key press, from a pin or from the web page's test buttons.
 function osKey(t, key) {
   const now = Date.now();
+
+  // Power is a toggle and must always respond, even right after another key.
+  if (key === 'power') {
+    osPower(t, !t.os.power);
+    noteAction(t, 'OS power ' + (t.os.power ? 'on' : 'off'));
+    return;
+  }
+
   const last = (t.os.debounce && t.os.debounce[key]) || 0;
   if (now - last < OS_DEBOUNCE_MS) return;   // debounce: ignore bounce / double-fire
   if (!t.os.debounce) t.os.debounce = {};
   t.os.debounce[key] = now;
 
-  if (key === 'power') { osPower(t, !t.os.power); return; }
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return; }
 
   t.os.lastKey = key;
-  if (t.os.app === 'menu') menuKey(t, key);
-  else if (t.os.app === 'term') termKey(t, key);
+  const before = t.os.app;
+  if (before === 'menu') menuKey(t, key);
+  else if (before === 'term') termKey(t, key);
   else appKey(t, key);
 
-  if (!t.os.power) return;   // the "off" command
+  if (!t.os.power) { noteAction(t, 'OS off (terminal)'); return; }   // the "off" command
 
-  // Every handled key press clears the panel and writes the current screen again,
-  // even when the text did not change, so a button press always wipes whatever was
-  // left on the panel (and you can see the press was received).
+  // Clear + redraw on EVERY accepted key, even if the line is identical.
   if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
   else osDraw(t, osLine(t));
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
@@ -972,7 +999,9 @@ function osKey(t, key) {
 function osPins(t, bits) {
   const prev = t.prevIn || '00000000';
   OS_PINS.forEach((name, i) => {
-    if (bits[i] === '1' && prev[i] === '0') osKey(t, name);
+    const up = bits[i] === '1' && prev[i] === '0';
+    const down = bits[i] === '0' && prev[i] === '1';
+    if (up || (name === 'power' && POWER_ON_FALLING_EDGE && down)) osKey(t, name);
   });
 }
 
@@ -1210,6 +1239,7 @@ app.get('/api/status', (req, res) => {
     clear: t.last.clear,
     value: t.held !== null ? t.held : toValue(t.last),
     input: t.lastIn,
+    raw: t.lastRaw || '',
     action: t.lastAction,
     glyph: t.held !== null ? 'HELD (test)' : t.last.clear ? 'CLEAR SCREEN' : glyph(t.last.code),
     transmitter: {
@@ -1666,7 +1696,9 @@ const PAGE = `<!doctype html>
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
       document.getElementById('st6').textContent = 'callers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
-      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)') + ' | last action: ' + (s.action || 'none');
+      document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)')
+        + ' | raw: ' + (s.raw ? JSON.stringify(s.raw) : '(no body)')
+        + ' | last action: ' + (s.action || 'none');
       document.getElementById('st9').textContent = 'transmitters on this server: ' + tr.count + ' | this one created ' + new Date(tr.createdAt).toLocaleString();
     } catch (e) {}
   }

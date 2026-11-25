@@ -1,77 +1,45 @@
-// Groq-powered text sender + simulated OS for Build Logic's 16x16 RGB panel
+// Groq-powered panel sender + simulated OS with a separate POST-only keyboard.
 //
-// TWO MODES per transmitter (switch on the web page, section "5. Simulated OS"):
+// DISPLAY TRANSMITTER (the only transmitter that receives display output):
+//   URL:    https://YOUR-TUNNEL-URL/out
+//   Method: GET or POST (existing behavior)
+//   Header: {"pass":"YOUR_PANEL_PASSWORD"}
+//   This transmitter alone receives {"value":"........"} display frames.
 //
-//   AI mode (default): you type a message on the web page; the server asks a Groq-hosted
-//   model for a SHORT reply, turns each character into its 7-bit code (shift + 6
-//   character pins) and feeds it to ONE HTTP Transmitter, one frame per poll. The panel
-//   shows YOUR message first, then the reply underneath it.
+// FOUR AUXILIARY KEYBOARD TRANSMITTERS (POST only; no display output is returned):
+//   /keys/1  pins 1-8 = A B C D E F G H
+//   /keys/2  pins 1-8 = I J K L M N O P
+//   /keys/3  pins 1-8 = Q R S T U V W X
+//   /keys/4  pin 1 = Y, pin 2 = Z, pin 3 = ENTER (pins 4-8 unused)
+// Each key is an independent input pin. Send the current 8-pin state in a POST body,
+// e.g. {"value":"10000000"}; also POST the released 0 state before pressing it again.
+// The server reacts only to 0 -> 1 transitions.
+// All four keyboard transmitters use the SAME pass header as the display transmitter,
+// so every key controls that panel's currently open OS application. Their responses
+// are HTTP 204 with no body: they never return display frames.
 //
-//   OS mode: a tiny SIMULATED operating system (nothing real runs, it all happens in this
-//   script). The panel shows ONE line. The pins the transmitter POSTs are the keys:
-//        pin 1 = I/O (on / off; off = blank screen until pressed again)
-//        pin 2 = DOWN    pin 3 = UP    pin 4 = SELECT    pin 5 = FN1    pin 6 = FN2
-//   UP / DOWN change the selected app, SELECT opens it. Apps: ai chat, terminal, text editor, clock, dice.
-//   Every handled key press clears the panel first. Details in the SIMULATED OS section below.
+// There are also individual POST endpoints /key/a through /key/z and /key/enter.
+// These accept {"pressed":true/false}, or an 8-bit value with any pin high on press. They are
+// an optional one-key-per-transmitter alternative; the four pin banks are the efficient
+// setup and require only four auxiliary transmitters. If you choose the individual
+// one-key endpoints literally (one device/URL per letter plus Enter), that is 27 input
+// transmitters plus the display transmitter = 28 total.
 //
-// The conversation (AI mode) is remembered server-side (the last MAX_HISTORY_TURNS
-// exchanges). Memory lives in this process only, like the key, so it is forgotten when
-// the server restarts. The OS state is also in memory only.
+// RECOMMENDED TOTAL: 1 display transmitter + 4 keyboard banks = 5 transmitters.
+// The server accepts the alphabet/Enter keys only while the default panel is in OS
+// mode and powered on. Text is routed to the open terminal, text editor, or AI chat app.
 //
-// You can set your own AI prompt (system prompt) on the web page, under
-// "4. AI prompt". It is kept per transmitter, in memory only. To start every new
-// transmitter with a custom prompt, use PANEL_PROMPT="You are a pirate..." node panel-text.js
+// FN1 and FN2 now have app-specific actions; they are no longer used as a shared
+// character picker. See the OS section and the web page for each app's key meanings.
 //
 // Setup:
 //   npm install express
-//   node panel-text.js                          (Node 18+ is required: it uses fetch)
-//   or: GROQ_API_KEY=gsk_... node panel-text.js (skip typing the key on the page)
-//   (second terminal) cloudflared tunnel --url http://localhost:3000   (or ngrok http 3000)
+//   node panel-text-keyboard.js                 (Node 18+ required; uses fetch)
+//   or: GROQ_API_KEY=gsk_... node panel-text-keyboard.js
+//   cloudflared tunnel --url http://localhost:3000   (or ngrok http 3000)
 //
-// Web page (your browser):  https://YOUR-TUNNEL-URL/
-// Transmitter Url:          https://YOUR-TUNNEL-URL/out
-//
-// ACCESS: there is no server-wide password. Instead, every request carries a "pass"
-// header, and the value of that header identifies ONE transmitter (panel). In Build
-// Logic, add this HTTP header to your HTTP Transmitter:
-//
-//     pass: my-secret-password
-//
-// The headers field on the transmitter takes a dictionary, so paste:
-//
-//     {"pass":"my-secret-password"}
-//
-// On the web page, type the SAME password under "1. Connect to a transmitter". The OS
-// uses that same password: it is just another section of the page for the same
-// transmitter. Any password works: type a new one and the server creates a new
-// transmitter (a new empty panel); type an existing one and you are back on that panel.
-//
-// MULTIPLE TRANSMITTERS: every different password is a separate panel. Each has its
-// own frame queue, conversation, prompt, OS state and diagnostics.
-//
-// HTTP Transmitter: the transmitter sends its own pin state to /out, either POSTed in
-// the body as {"value":"00000000"} or on a GET as /out?value=00000000 (with the pass
-// header), and the server answers with the next panel frame, also as
-//   {"value":"........"}.
-// The FIRST characters of what you send are the input pins (first pin = leftmost).
-//   AI mode: pin 1 = INTERRUPT, pin 2 = REDO
-//   OS mode: pins 1-6 = POWER, DOWN, UP, SELECT, FN1, FN2 (see above)
-// All momentary controls act only on a rising edge (0 -> 1). Button releases do NOT
-// trigger a second action. Only the power pin can optionally use its falling edge for
-// a latching switch. A request with no input value re-arms the controls as released
-// without triggering them. If buttons read 0 when pressed, set PINS_ACTIVE_LOW = true.
-//
-// The Groq API key is REQUIRED for AI mode and for the OS "ai chat" app. It is shared
-// by all transmitters on this server. The rest of the simulated OS does NOT need a key.
-//
-// Output is an 8-bit string, leftmost bit first:
-//   X S C5 C4 C3 C2 C1 C0
-//   X      = clear screen. 1 only in the clear frame, 0 everywhere else.
-//   S      = shift pin
-//   C5..C0 = the 6 character pins
-// Example: 'A' = 01000001, 'a' = 00000001, clear screen = 10000000, idle = 00000000.
-
-// BUTTON INPUT FIX v5: input-free polls re-arm the keys without creating a press.
+// Existing AI text sender, Groq prompt, output encoding and display queue are retained.
+// Output format: X S C5 C4 C3 C2 C1 C0; clear='10000000', idle='00000000'.
 
 const express = require('express');
 
@@ -90,7 +58,7 @@ app.use((req, res, next) => {
 });
 
 // /out reads the body as raw text whatever the Content-Type is (see readInputBits).
-app.use('/out', express.text({ type: () => true }));
+app.use(['/out', '/keys', '/key'], express.text({ type: () => true }));
 app.use(express.json());
 
 function givenPassword(req) {
@@ -245,6 +213,9 @@ function makeTransmitter(password) {
     // ---- input (pins) ----
     prevIn: null,
     lastIn: null,
+    keyBankPrev: new Map(),       // POST-only auxiliary keyboard banks
+    directKeyPrev: new Map(),     // optional one-endpoint-per-key inputs
+    lastKeyboardKey: '',
     lastRaw: '',                     // what the game sent, for diagnostics
     lastAction: '',
 
@@ -766,6 +737,7 @@ async function runOsChat(t, message) {
   pushHistory(t, 'user', message);
   pushHistory(t, 'assistant', reply);
   t.lastUserMessage = message;
+  t.os.ai.draft = '';
 
   const display = padToRow(cleanReply(reply)) + '(click select to exit)';
   osAiDraw(t, display);
@@ -776,43 +748,28 @@ async function runOsChat(t, message) {
 
 // ======================= SIMULATED OS =======================
 //
-// A very small pretend OS (nothing real runs). The screen is ONE line of text, at most
-// CHARS_PER_ROW characters, except the AI app which uses the whole panel.
-// Every handled key press clears the panel first, then the current line is written
-// (even if the text did not change), so no leftovers can survive a button press.
+// The default /out transmitter handles the OS controls:
+//   pin 1 POWER, pin 2 DOWN, pin 3 UP, pin 4 SELECT, pin 5 FN1, pin 6 FN2.
+// The four separate /keys/N POST transmitters handle alphabet + ENTER input.
+// Letters are routed into whichever of terminal, text edit, or AI chat is open.
+// A keyboard bank reacts only to rising edges, so POST an all-zero state on release.
 //
-// KEYS: input pins 1-6 of the value POSTed to /out (in OS mode). Each fires only on
-// its rising edge (0 -> 1), so releasing a button never repeats the action. The power
-// pin may optionally use its falling edge for a latching switch (see setting below).
-//   pin 1  I/O     on / off. Off = blank screen until you press it again.
-//   pin 2  DOWN
-//   pin 3  UP
-//   pin 4  SELECT
-//   pin 5  FN1
-//   pin 6  FN2
-//
-// MENU      the selected app is shown with a "▶" arrow and a position counter.
-//           UP / DOWN change it, SELECT opens it.
-// terminal  Uses the SAME picker as text editor: FN1 cycles space, a-z; FN2 inserts.
-//           SELECT cancels the preview, backspaces, or exits when empty; DOWN runs a command.
-// text editor  FN1 cycles SPACE, a-z (in that order); FN2 inserts the selection and
-//           advances to the next character. SELECT cancels/deletes; when empty it exits.
-//           DOWN finishes and returns to the menu. Text stays until the OS is powered off.
-// ai chat   Uses the Groq key. You type on the WEB PAGE ("3. Message"), the panel
-//           shows the answer with "(click select to exit)" at the end. SELECT = back.
-// clock     shows the time. FN1 refreshes. SELECT = back.
-// dice      FN1 rolls. UP / DOWN pick the die. SELECT = back.
+// FN1 / FN2 are app-specific:
+//   menu:     FN1 previous app, FN2 next app
+//   terminal: FN1 inserts a space, FN2 clears the command line
+//   text edit:FN1 inserts a space, FN2 backspaces
+//   AI chat:  FN1 inserts a space, FN2 backspaces
+//   clock:    FN1 toggles time/date, FN2 toggles 12/24-hour format
+//   dice:     FN1 rolls, FN2 selects the next die size
+// ENTER is handled by the auxiliary keyboard: terminal runs, text edit saves,
+// and AI chat sends the typed message to Groq.
 
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
-const OS_VERSION = '1.2';
-const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2'];   // pin 1 .. pin 6
-const OS_DEBOUNCE_MS = 40;   // short bounce filter; edge detection prevents held-button repeats
-
-// Leave false for ordinary momentary buttons: each press is 0 -> 1 and release is ignored.
-// Set true ONLY when the power input is a latching switch that stays high until toggled
-// again; then its falling edge also toggles power. Do not enable for a momentary button.
+const OS_VERSION = '1.3';
+const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2']; // main transmitter pins 1-6
+const OS_DEBOUNCE_MS = 40;
 const POWER_ON_FALLING_EDGE = false;
 
 const APPS = [
@@ -823,11 +780,16 @@ const APPS = [
   { id: 'dice', name: 'dice' },
 ];
 
-// Both terminal and text editor use the same FN1/FN2 character-entry system.
-// FN1 cycles: space, a, b, ... z. FN2 inserts the selected character.
-const EDITOR_LETTERS = ' abcdefghijklmnopqrstuvwxyz';
+// The four 8-pin POST keyboard banks. Array position 0 is physical pin 1.
+const KEY_BANKS = [
+  { id: '1', keys: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] },
+  { id: '2', keys: ['i', 'j', 'k', 'l', 'm', 'n', 'o', 'p'] },
+  { id: '3', keys: ['q', 'r', 's', 't', 'u', 'v', 'w', 'x'] },
+  { id: '4', keys: ['y', 'z', 'enter', null, null, null, null, null] },
+];
 const EDITOR_MAX = 120;
 const TERM_MAX = EDITOR_MAX;
+const AI_DRAFT_MAX = 300;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 
 function makeOS() {
@@ -836,13 +798,14 @@ function makeOS() {
     app: 'menu',
     cursor: 0,
     bootedAt: 0,
-    screen: '',        // the line currently on the panel
+    screen: '',
     lastKey: '',
-    debounce: {},      // per-key timestamps for edge-debounce
-    term: { buf: '', choice: -1, out: null },
-    editor: { text: '', choice: -1 },
+    debounce: {},
+    term: { buf: '', out: null },
+    editor: { text: '' },
+    clock: { showDate: false, use24h: true },
     dice: { side: 1, result: null },
-    ai: { shown: false, text: '' },  // text = full multi-row AI answer
+    ai: { shown: false, text: '', draft: '' },
   };
 }
 
@@ -857,7 +820,7 @@ function padToRow(text) {
   return text + ' '.repeat(pad);
 }
 
-// The one line the current app wants on the screen
+// The one line the current app wants on the screen.
 function osLine(t) {
   const os = t.os;
   switch (os.app) {
@@ -866,27 +829,26 @@ function osLine(t) {
     case 'term': {
       const tm = os.term;
       if (tm.out !== null) return tm.out;
-      const marker = tm.choice < 0
-        ? '_'
-        : (EDITOR_LETTERS[tm.choice] === ' ' ? 'SP_' : EDITOR_LETTERS[tm.choice].toUpperCase() + '_');
-      const text = tm.buf + marker;
-      return '# ' + Array.from(text).slice(-(CHARS_PER_ROW - 2)).join('');
+      return '# ' + Array.from(tm.buf).slice(-(CHARS_PER_ROW - 2)).join('') + '_';
     }
     case 'edit': {
-      const ed = os.editor;
-      const marker = ed.choice < 0 ? '_' : (EDITOR_LETTERS[ed.choice] === ' ' ? 'SP' : EDITOR_LETTERS[ed.choice]);
-      const visibleCount = Math.max(0, CHARS_PER_ROW - 6 - marker.length);
-      const visibleText = Array.from(ed.text).slice(-visibleCount).join('');
-      return 'EDIT:' + visibleText + '=' + marker;
+      const visibleText = Array.from(os.editor.text).slice(-(CHARS_PER_ROW - 6)).join('');
+      return 'EDIT:' + visibleText + '_';
     }
     case 'clok': {
       const d = new Date();
-      return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      if (os.clock.showDate) {
+        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      }
+      let hours = d.getHours();
+      if (!os.clock.use24h) hours = (hours % 12) || 12;
+      return pad2(hours) + ':' + pad2(d.getMinutes()) + (os.clock.use24h ? '' : (d.getHours() >= 12 ? ' PM' : ' AM'));
     }
     case 'dice':
       return 'd' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result);
     case 'ai':
-      return os.ai.shown ? (os.ai.text || os.screen) : 'ask me';
+      if (os.ai.shown) return os.ai.text || os.screen;
+      return 'AI:' + (os.ai.draft || '_');
     default:
       return 'err';
   }
@@ -920,10 +882,11 @@ function osPower(t, on) {
   os.cursor = 0;
   os.screen = '';
   os.lastKey = '';
-  os.term = { buf: '', choice: -1, out: null };
-  os.editor = { text: '', choice: -1 };
+  os.term = { buf: '', out: null };
+  os.editor = { text: '' };
+  os.clock = { showDate: false, use24h: true };
   os.dice = { side: 1, result: null };
-  os.ai = { shown: false, text: '' };
+  os.ai = { shown: false, text: '', draft: '' };
   if (on) {
     os.bootedAt = Date.now();
     osDraw(t, osLine(t));
@@ -937,8 +900,7 @@ function osPower(t, on) {
 
 // ---- terminal ----
 
-// Accept number words because terminal input deliberately uses the same a-z + space
-// picker as the text editor (there are no digit characters in that picker).
+// Accept number words because the dedicated keyboard provides alphabet keys and space.
 const NUMBER_WORDS = {
   zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
@@ -958,7 +920,6 @@ function runCommand(t) {
   const tm = t.os.term;
   const line = tm.buf.trim().toLowerCase();
   tm.buf = '';
-  tm.choice = -1;
   tm.out = null;
   if (!line) return;
 
@@ -1035,105 +996,101 @@ function runCommand(t) {
 
 function termKey(t, key) {
   const tm = t.os.term;
-
-  // Any key returns from a command result to the terminal prompt.
   if (tm.out !== null) {
     tm.out = null;
-    return;
+    tm.buf = '';
   }
-
   if (key === 'fn1') {
-    // Exactly the same character cycle as the text editor: space, then a-z.
-    tm.choice = (tm.choice + 1) % EDITOR_LETTERS.length;
+    if (tm.buf.length < TERM_MAX) tm.buf += ' ';
   } else if (key === 'fn2') {
-    // Insert only an explicitly selected character, then start a fresh position.
-    if (tm.choice >= 0) {
-      if (tm.buf.length < TERM_MAX) tm.buf += EDITOR_LETTERS[tm.choice];
-      tm.choice = -1;
-    }
+    tm.buf = '';
   } else if (key === 'select') {
-    // SELECT cancels the preview first; otherwise it backspaces or exits if empty.
-    if (tm.choice >= 0) tm.choice = -1;
-    else if (tm.buf.length) tm.buf = tm.buf.slice(0, -1);
-    else t.os.app = 'menu';
+    t.os.app = 'menu';
   } else if (key === 'down') {
-    // DOWN runs the committed command. An uncommitted preview is discarded.
-    tm.choice = -1;
     runCommand(t);
   }
 }
 
-// ---- text editor ----
-
+// Dedicated alphabet keys type directly into the editor. FN1 adds a space, FN2 deletes.
 function editorKey(t, key) {
   const ed = t.os.editor;
-
   if (key === 'fn1') {
-    // First FN1 press selects the space; subsequent presses go a, b, ... z.
-    ed.choice = (ed.choice + 1) % EDITOR_LETTERS.length;
+    if (ed.text.length < EDITOR_MAX) ed.text += ' ';
   } else if (key === 'fn2') {
-    // FN2 inserts the currently selected character and moves to a fresh position.
-    if (ed.choice >= 0) {
-      if (ed.text.length < EDITOR_MAX) ed.text += EDITOR_LETTERS[ed.choice];
-      ed.choice = -1;
-    }
+    ed.text = ed.text.slice(0, -1);
   } else if (key === 'select') {
-    // SELECT cancels a preview first; otherwise it acts as backspace.
-    if (ed.choice >= 0) ed.choice = -1;
-    else if (ed.text.length) ed.text = ed.text.slice(0, -1);
-    else t.os.app = 'menu';
+    t.os.app = 'menu';
   } else if (key === 'down') {
-    // Finish editing. The text remains stored until the OS is powered off.
-    ed.choice = -1;
     t.os.app = 'menu';
   }
 }
 
-// ---- menu and the other apps ----
-
 function menuKey(t, key) {
   const os = t.os;
-  if (key === 'down') os.cursor = (os.cursor + 1) % APPS.length;
-  else if (key === 'up') os.cursor = (os.cursor - 1 + APPS.length) % APPS.length;
+  if (key === 'down' || key === 'fn2') os.cursor = (os.cursor + 1) % APPS.length;
+  else if (key === 'up' || key === 'fn1') os.cursor = (os.cursor - 1 + APPS.length) % APPS.length;
   else if (key === 'select') {
     os.app = APPS[os.cursor].id;
-    if (os.app === 'term') os.term = { buf: '', choice: -1, out: null };
+    if (os.app === 'term') os.term = { buf: '', out: null };
     if (os.app === 'dice') os.dice.result = rollDie(os);
     if (os.app === 'ai') {
-      os.ai = { shown: false, text: '' };
-      clearHistory(t); // fresh conversation each time you enter the AI app
+      os.ai = { shown: false, text: '', draft: '' };
+      clearHistory(t);
     }
   }
 }
 
 function appKey(t, key) {
   const os = t.os;
-  if (os.app === 'edit') {
-    editorKey(t, key);
-    return;
-  }
   if (key === 'select') {
-    if (os.app === 'ai') abandonChat(t); // stop any in-flight Groq reply
+    if (os.app === 'ai') abandonChat(t);
     os.app = 'menu';
     return;
   }
-  if (os.app === 'dice') {
-    if (key === 'down') { os.dice.side = (os.dice.side + 1) % DICE_SIDES.length; os.dice.result = null; }
-    else if (key === 'up') { os.dice.side = (os.dice.side - 1 + DICE_SIDES.length) % DICE_SIDES.length; os.dice.result = null; }
-    else if (key === 'fn1') os.dice.result = rollDie(os);
+
+  switch (os.app) {
+    case 'ai':
+      if (os.ai.shown) {
+        os.ai.shown = false;
+        os.ai.text = '';
+      }
+      if (key === 'fn1' && os.ai.draft.length < AI_DRAFT_MAX) os.ai.draft += ' ';
+      else if (key === 'fn2') os.ai.draft = os.ai.draft.slice(0, -1);
+      break;
+    case 'term':
+      termKey(t, key);
+      break;
+    case 'edit':
+      editorKey(t, key);
+      break;
+    case 'clok':
+      if (key === 'fn1') os.clock.showDate = !os.clock.showDate;
+      else if (key === 'fn2') os.clock.use24h = !os.clock.use24h;
+      break;
+    case 'dice':
+      if (key === 'fn1') os.dice.result = rollDie(os);
+      else if (key === 'fn2' || key === 'down') {
+        os.dice.side = (os.dice.side + 1) % DICE_SIDES.length;
+        os.dice.result = null;
+      } else if (key === 'up') {
+        os.dice.side = (os.dice.side - 1 + DICE_SIDES.length) % DICE_SIDES.length;
+        os.dice.result = null;
+      }
+      break;
   }
-  // clock: nothing to do, the line is rebuilt after every key
-  // ai: ignore other keys; keep the answer on screen
 }
 
-// One key press, from a pin or from the web page's test buttons.
+// Redraw the current app, using the full panel for an AI answer.
+function redrawOS(t) {
+  if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
+  else osDraw(t, osLine(t));
+}
+
+// One control press from the main transmitter or the web page.
 function osKey(t, key) {
   const now = Date.now();
   const last = (t.os.debounce && t.os.debounce[key]) || 0;
-
-  // Debounce every key, including power. This prevents a momentary button's release
-  // edge from immediately undoing the press, while still allowing later switch changes.
-  if (OS_DEBOUNCE_MS > 0 && now - last < OS_DEBOUNCE_MS) return false;
+  if (OS_DEBOUNCE_MS > 0 && last && now - last < OS_DEBOUNCE_MS) return false;
   if (!t.os.debounce) t.os.debounce = {};
   t.os.debounce[key] = now;
 
@@ -1142,52 +1099,194 @@ function osKey(t, key) {
     noteAction(t, 'OS power ' + (t.os.power ? 'on' : 'off'));
     return true;
   }
-
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return false; }
 
   t.os.lastKey = key;
-  const before = t.os.app;
-  if (before === 'menu') menuKey(t, key);
-  else if (before === 'term') termKey(t, key);
+  if (t.os.app === 'menu') menuKey(t, key);
   else appKey(t, key);
 
-  if (!t.os.power) { noteAction(t, 'OS off (terminal)'); return true; }   // the "off" command
-
-  // Clear + redraw on EVERY accepted key, even if the line is identical.
-  if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
-  else osDraw(t, osLine(t));
+  if (!t.os.power) { noteAction(t, 'OS off (terminal)'); return true; }
+  redrawOS(t);
   noteAction(t, 'OS ' + key + ' (' + t.os.app + ')');
   return true;
 }
 
-// Input pins in OS mode. Only rising edges activate a button. A poll without an
-// input payload resets the baseline to released in outHandler, so the same button
-// can be pressed again even when the transmitter sends input only on press events.
+// Main transmitter pin input remains available for power/navigation/FN controls.
 function osPins(t, bits) {
   const prev = t.prevIn || '00000000';
   const pressed = [];
-
-  // Only a rising edge is a normal button press. In particular, a falling edge on
-  // DOWN/UP/SELECT/FN1/FN2 must never be interpreted as another key press.
   for (let i = 0; i < OS_PINS.length; i++) {
     const name = OS_PINS[i];
     const rose = bits[i] === '1' && prev[i] === '0';
-    const powerFell = name === 'power' && POWER_ON_FALLING_EDGE &&
-      bits[i] === '0' && prev[i] === '1';
-
+    const powerFell = name === 'power' && POWER_ON_FALLING_EDGE && bits[i] === '0' && prev[i] === '1';
     if (rose || powerFell) pressed.push(name);
   }
-
-  // A single input snapshot should represent one button. If the transmitter reports
-  // POWER and another key together, reject the chord instead of performing both.
   if (pressed.length > 1) {
     noteAction(t, 'OS ignored simultaneous buttons: ' + pressed.join(' + '));
     return false;
   }
-
   if (pressed.length === 1) return osKey(t, pressed[0]);
   return false;
 }
+
+// A letter key is sent to whichever text-capable application is currently open.
+function keyboardLetter(t, letter) {
+  if (!t.os.power || t.mode !== 'os') {
+    noteAction(t, 'keyboard ' + letter + ' ignored (OS off or not in OS mode)');
+    return false;
+  }
+  const os = t.os;
+  if (os.app === 'term') {
+    if (os.term.out !== null) { os.term.out = null; os.term.buf = ''; }
+    if (os.term.buf.length < TERM_MAX) os.term.buf += letter;
+  } else if (os.app === 'edit') {
+    if (os.editor.text.length < EDITOR_MAX) os.editor.text += letter;
+  } else if (os.app === 'ai') {
+    if (os.ai.shown) { os.ai.shown = false; os.ai.text = ''; os.ai.draft = ''; }
+    if (os.ai.draft.length < AI_DRAFT_MAX) os.ai.draft += letter;
+  } else {
+    noteAction(t, 'keyboard ' + letter + ' ignored (open terminal, text edit, or ai chat)');
+    return false;
+  }
+  os.lastKey = letter;
+  redrawOS(t);
+  noteAction(t, 'keyboard key ' + letter + ' (' + os.app + ')');
+  t.lastKeyboardKey = letter;
+  return true;
+}
+
+// The dedicated Enter key has app-specific behavior.
+function keyboardEnter(t) {
+  if (!t.os.power || t.mode !== 'os') {
+    noteAction(t, 'keyboard ENTER ignored (OS off or not in OS mode)');
+    return false;
+  }
+  const os = t.os;
+  os.lastKey = 'enter';
+  t.lastKeyboardKey = 'ENTER';
+
+  if (os.app === 'term') {
+    runCommand(t);
+    if (t.os.power) redrawOS(t); // 'off' must leave the clear frame intact
+    noteAction(t, 'keyboard ENTER ran terminal command');
+    return true;
+  }
+  if (os.app === 'edit') {
+    // Finish/save the current text; it remains in memory until the OS is powered off.
+    os.app = 'menu';
+    redrawOS(t);
+    noteAction(t, 'keyboard ENTER saved text editor and returned to menu');
+    return true;
+  }
+  if (os.app === 'ai') {
+    const message = os.ai.draft.trim();
+    if (!message) { noteAction(t, 'AI ENTER ignored (empty message)'); return false; }
+    if (!groqKey) { noteAction(t, 'AI ENTER ignored (no Groq key)'); return false; }
+    if (t.chatBusy) { noteAction(t, 'AI ENTER ignored (still working)'); return false; }
+    os.ai.draft = '';
+    os.ai.shown = false;
+    os.ai.text = '';
+    osDraw(t, 'thinking...');
+    runOsChat(t, message).catch((e) => {
+      os.ai.draft = message;
+      os.ai.shown = false;
+      os.ai.text = '';
+      redrawOS(t);
+      noteAction(t, 'AI keyboard send failed: ' + e.message);
+    });
+    noteAction(t, 'keyboard ENTER sent AI message');
+    return true;
+  }
+  noteAction(t, 'keyboard ENTER ignored (no text input in ' + os.app + ')');
+  return false;
+}
+
+function dispatchKeyboardKey(t, key) {
+  if (key === 'enter') return keyboardEnter(t);
+  return keyboardLetter(t, key);
+}
+
+// Optional individual endpoints accept JSON booleans, 1/0, or true/false text.
+function toPressedBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && (value === 0 || value === 1)) return value === 1;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (/^[01]{1,8}$/.test(v)) return v.includes('1');
+    if (['1', 'true', 'pressed', 'on'].includes(v)) return true;
+    if (['0', 'false', 'released', 'off'].includes(v)) return false;
+  }
+  return null;
+}
+
+function readPressed(req) {
+  let raw = req.body;
+  if (typeof raw === 'string') {
+    const body = raw.trim();
+    try { raw = JSON.parse(body); } catch (_) {
+      const form = new URLSearchParams(body);
+      raw = form.has('pressed') ? form.get('pressed') : body;
+    }
+  }
+  if (raw && typeof raw === 'object') {
+    if (raw.pressed !== undefined) return toPressedBoolean(raw.pressed);
+    if (raw.value !== undefined) return toPressedBoolean(raw.value);
+  }
+  if (req.query.pressed !== undefined) return toPressedBoolean(req.query.pressed);
+  if (req.query.value !== undefined) return toPressedBoolean(req.query.value);
+  return toPressedBoolean(raw);
+}
+
+function inputPanel(req, res) {
+  const password = givenPassword(req);
+  if (!password) {
+    res.status(403).json({ error: 'Send the same pass header as the display transmitter.' });
+    return null;
+  }
+  if (password.length > MAX_PASSWORD_CHARS) {
+    res.status(400).json({ error: 'Password too long (max ' + MAX_PASSWORD_CHARS + ' characters).' });
+    return null;
+  }
+  return getTransmitter(password);
+}
+
+// BANK ENDPOINTS: each POST-only device supplies its own eight pin states.
+app.post('/keys/:bank', (req, res) => {
+  const t = inputPanel(req, res);
+  if (!t) return;
+  const bank = KEY_BANKS.find((item) => item.id === String(req.params.bank));
+  if (!bank) return res.status(404).json({ error: 'Unknown keyboard bank. Use /keys/1 through /keys/4.' });
+  const bits = readInputBits(req);
+  if (bits === null) return res.status(400).json({ error: 'Send an 8-bit value, e.g. {"value":"10000000"}.' });
+
+  const prev = t.keyBankPrev.get(bank.id) || '00000000';
+  const rising = [];
+  for (let i = 0; i < 8; i++) {
+    if (bits[i] === '1' && prev[i] === '0' && bank.keys[i]) rising.push(bank.keys[i]);
+  }
+  t.keyBankPrev.set(bank.id, bits);
+  if (rising.length > 1) {
+    noteAction(t, 'keyboard bank ' + bank.id + ' ignored simultaneous keys: ' + rising.join('+'));
+  } else if (rising.length === 1) {
+    dispatchKeyboardKey(t, rising[0]);
+  }
+  // This is an input-only transmitter. Never return panel data on this endpoint.
+  return res.status(204).end();
+});
+
+// INDIVIDUAL ENDPOINTS: /key/a ... /key/z and /key/enter.
+app.post('/key/:key', (req, res) => {
+  const t = inputPanel(req, res);
+  if (!t) return;
+  const key = String(req.params.key || '').toLowerCase();
+  if (!/^(?:[a-z]|enter)$/.test(key)) return res.status(404).json({ error: 'Use /key/a through /key/z or /key/enter.' });
+  const pressed = readPressed(req);
+  if (pressed === null) return res.status(400).json({ error: 'Send {"pressed":true} on press and {"pressed":false} on release.' });
+  const prev = t.directKeyPrev.get(key) || false;
+  t.directKeyPrev.set(key, pressed);
+  if (pressed && !prev) dispatchKeyboardKey(t, key);
+  return res.status(204).end();
+});
 
 // ======================= API FOR THE WEB PAGE =======================
 
@@ -1342,9 +1441,10 @@ app.post('/api/os/mode', (req, res) => {
 app.post('/api/os/key', (req, res) => {
   const t = req.transmitter;
   const key = String(req.body.key || '');
-  if (!OS_PINS.includes(key)) return res.status(400).json({ error: 'Unknown key.' });
+  if (!OS_PINS.includes(key) && key !== 'enter') return res.status(400).json({ error: 'Unknown key.' });
   if (t.mode !== 'os') return res.status(409).json({ error: 'Switch this transmitter to OS mode first.' });
-  osKey(t, key);
+  if (key === 'enter') keyboardEnter(t);
+  else osKey(t, key);
   res.json({ ok: true, power: t.os.power, screen: t.os.screen });
 });
 
@@ -1521,7 +1621,7 @@ const PAGE = `<!doctype html>
   <h2>5. Simulated OS (same password)</h2>
   <div class="st" id="osmode">mode: AI text sender</div>
   <button id="osmodebtn" onclick="toggleOsMode()">Switch to OS mode</button>
-  <small>In OS mode the pins the game POSTs are keys: 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The panel shows one line (the ai chat app can use more rows). The AI chat is paused until you switch back.</small>
+  <small>Default display transmitter: /out. Its pins are 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The four extra keyboard transmitters POST to /keys/1 through /keys/4 and never receive display output. All five use the same pass header.</small>
   <pre class="screen" id="osscreen">(AI mode)</pre>
   <div class="keys">
     <button onclick="osKey('power')">On/off (1)</button>
@@ -1530,10 +1630,11 @@ const PAGE = `<!doctype html>
     <button onclick="osKey('select')">Select (4)</button>
     <button onclick="osKey('fn1')">FN1 (5)</button>
     <button onclick="osKey('fn2')">FN2 (6)</button>
+    <button onclick="osKey('enter')">Keyboard Enter</button>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
-  <small>Menu: up/down pick an app (▶ shows the selection), select opens it. terminal: same text-entry controls as the text editor — FN1 cycles space then a-z, FN2 inserts the selected character; SELECT cancels the preview or backspaces; DOWN runs the command. Commands: help, echo, time, date, ver, about, hello, rand, add, sub, mul, div, uptime, clear, exit, off. For math and rand limits, spell numbers (example: add five three). text editor: FN1 cycles space then a-z; FN2 inserts; SELECT cancels/deletes; DOWN finishes. clock: FN1 refreshes. dice: FN1 rolls, up/down pick the die. ai chat: type in the "3. Message" box above, send, then press select to exit.</small>
+  <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER on pins 1-3. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z and /key/enter, with {&quot;pressed&quot;:true/false} or an 8-bit pin value; those need 27 input transmitters if configured one device per key (28 total including display). Recommended bank setup is 5 total. Only /out returns panel frames. Menu: UP/FN1 previous app, DOWN/FN2 next app, SELECT opens. Terminal: keyboard letters type; FN1=space, FN2=clear line, ENTER runs command; DOWN also runs; SELECT exits. Commands: help, echo, time, date, ver, about, hello, rand, add, sub, mul, div, uptime, clear, exit, off. For math and rand limits, spell numbers (example: add five three). Text editor: keyboard letters type; FN1=space, FN2=backspace, ENTER saves and returns to menu; SELECT exits. AI chat: keyboard letters type; FN1=space, FN2=backspace, ENTER sends to Groq; SELECT exits. Clock: FN1 toggles time/date, FN2 toggles 12/24-hour format. Dice: FN1 rolls, FN2 cycles dice type; UP/DOWN also change dice type.</small>
 </section>
 
 <details>
@@ -1880,7 +1981,7 @@ const PAGE = `<!doctype html>
       document.getElementById('st4').textContent = 'value: ' + s.value;
       var p = s.polls;
       document.getElementById('st5').textContent = 'polls/sec: ' + p.perSec + ' | longest gap (10 s): ' + p.maxGapMs + ' ms | last poll: ' + (p.agoMs === null ? 'none yet' : p.agoMs + ' ms ago') + ' | total: ' + p.total;
-      document.getElementById('st6').textContent = 'callers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
+      document.getElementById('st6').textContent = 'display pollers of /out for this password: ' + (p.clients.length ? p.clients.join('  ||  ') : 'none');
       document.getElementById('st7').textContent = 'sent to panel (newest last): ' + (s.sent || '(nothing yet)');
       document.getElementById('st8').textContent = 'posted by game: ' + (s.input || '(nothing yet)')
         + ' | raw: ' + (s.raw ? JSON.stringify(s.raw) : '(no body)')
@@ -1912,10 +2013,14 @@ app.get('/', (_req, res) => res.send(PAGE));
 app.listen(PORT, () => {
   const dictionary = JSON.stringify({ [PASS_HEADER]: '<your-password>' });
   console.log('Panel page: http://localhost:' + PORT + '/');
-  console.log('Game transmitter path: /out');
+  console.log('Default display transmitter: /out (GET or POST; the only endpoint that returns display frames).');
+  console.log('Auxiliary keyboard transmitters: POST /keys/1, /keys/2, /keys/3, /keys/4 (same pass header; no response body).');
+  console.log('Optional single-key POST paths: /key/a ... /key/z and /key/enter.');
+  console.log('Hardware count: 1 display + 4 keyboard = 5 total.');
   console.log('  Set this header on your HTTP Transmitter:  ' + PASS_HEADER + ': <your-password>');
   console.log('  Headers dictionary:  ' + dictionary);
-  console.log('  Each different pass value is a separate panel with its own queue.');
+  console.log('  Use the SAME pass value on the display transmitter and all four keyboard transmitters.');
+  console.log('  Different pass values still create separate panels.');
   console.log('  The page itself is open. Type the same password into it to control that panel.');
   console.log('  Simulated OS: switch a panel to OS mode in section 5 of the page.');
   console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page (AI mode + ai chat only; the rest of the OS does not need it).');

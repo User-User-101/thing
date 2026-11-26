@@ -225,6 +225,8 @@ function makeTransmitter(password) {
     lastIn: null,
     keyBankPrev: new Map(),       // POST-only auxiliary keyboard banks
     directKeyPrev: new Map(),     // optional one-endpoint-per-key inputs
+    keyBankLastFire: new Map(),   // repeat timing for keys in each keyboard bank
+    directKeyLastFire: new Map(), // repeat timing for individual-key endpoints
     lastKeyboardKey: '',
     lastKeyboardRequest: null,
     lastRaw: '',                     // what the game sent, for diagnostics
@@ -1022,7 +1024,7 @@ async function runOsChat(t, message) {
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
-const OS_VERSION = '1.4';
+const OS_VERSION = '1.5';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2', 'enter']; // main transmitter pins 1-6; optional pin 7 = ENTER
 const OS_DEBOUNCE_MS = 40;
 const POWER_ON_FALLING_EDGE = false;
@@ -2061,6 +2063,9 @@ function handleKeyboardEndpoint(req, res, routeName) {
   if (!t) return;
 
   const name = normalizeKeyboardKey(routeName);
+  // Keep endpoint handling safe even if a transmitter object was created by older code.
+  if (!(t.keyBankLastFire instanceof Map)) t.keyBankLastFire = new Map();
+  if (!(t.directKeyLastFire instanceof Map)) t.directKeyLastFire = new Map();
   const bank = KEY_BANKS.find((item) => item.id === name);
 
   if (bank) {

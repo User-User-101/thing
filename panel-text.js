@@ -1004,7 +1004,7 @@ async function runOsChat(t, message) {
 // ======================= SIMULATED OS =======================
 //
 // The /out transmitter handles the OS controls:
-//   pin 1 POWER, pin 2 DOWN, pin 3 UP, pin 4 SELECT, pin 5 FN1, pin 6 FN2.
+//   pin 1 POWER, pin 2 DOWN, pin 3 UP, pin 4 SELECT, pin 5 FN1, pin 6 FN2, optional pin 7 ENTER.
 // The four /keys/N POST transmitters handle typing (letters, ENTER, SPACE, BACKSPACE, . - /).
 // A keyboard bank reacts only to rising edges, so POST an all-zero state on release.
 //
@@ -1023,7 +1023,7 @@ async function runOsChat(t, message) {
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
 const OS_VERSION = '1.4';
-const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2']; // main transmitter pins 1-6
+const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2', 'enter']; // main transmitter pins 1-6; optional pin 7 = ENTER
 const OS_DEBOUNCE_MS = 40;
 const POWER_ON_FALLING_EDGE = false;
 
@@ -1045,6 +1045,9 @@ const KEY_BANKS = [
 ];
 const KEY_CHARS = { space: ' ', dot: '.', dash: '-', slash: '/' };
 const WEB_KEYBOARD_KEYS = new Set(['enter', 'space', 'backspace']);
+// Some transmitter setups keep POSTing the pressed state and do not send a zero on release.
+// Enter gets a slow repeat fallback so it can be pressed again after opening an app.
+const ENTER_REPEAT_MS = 700;
 
 // How many rows are redrawn while typing (small = fast) and for outputs/pages/replies.
 // The panel draws one character per poll, so keep INPUT_ROWS small.
@@ -1802,6 +1805,10 @@ function osKey(t, key) {
   }
   if (!t.os.power) { noteAction(t, 'OS ' + key + ' ignored (off)'); return false; }
 
+  // Support ENTER on the main transmitter's optional pin 7 as well as /keys/4 pin 3.
+  // Both inputs use the same app-aware handler so Enter behaves identically everywhere.
+  if (key === 'enter') return keyboardEnter(t);
+
   t.os.lastKey = key;
   if (t.os.app === 'menu') menuKey(t, key);
   else appKey(t, key);
@@ -2086,6 +2093,19 @@ function handleKeyboardEndpoint(req, res, routeName) {
       noteAction(t, 'keyboard bank ' + bank.id + ' ignored simultaneous keys: ' + rising.join('+'));
     } else if (rising.length === 1) {
       dispatchKeyboardKey(t, rising[0]);
+      t.keyBankLastFire.set(bank.id + ':' + rising[0], Date.now());
+    } else {
+      // Enter-only repeat fallback: handles transmitters that never POST the all-zero
+      // release state. Normal zero->one presses still work immediately.
+      const enterIndex = bank.keys.indexOf('enter');
+      if (enterIndex >= 0 && bits[enterIndex] === '1' && prev[enterIndex] === '1') {
+        const fireKey = bank.id + ':enter';
+        const lastFire = t.keyBankLastFire.get(fireKey) || 0;
+        if (Date.now() - lastFire >= ENTER_REPEAT_MS) {
+          dispatchKeyboardKey(t, 'enter');
+          t.keyBankLastFire.set(fireKey, Date.now());
+        }
+      }
     }
     return res.status(200).json({ value: '00000000' });
   }
@@ -2101,7 +2121,16 @@ function handleKeyboardEndpoint(req, res, routeName) {
     }
     const prev = t.directKeyPrev.get(name) || false;
     t.directKeyPrev.set(name, pressed);
-    if (pressed && !prev) dispatchKeyboardKey(t, name);
+    if (pressed && !prev) {
+      dispatchKeyboardKey(t, name);
+      t.directKeyLastFire.set(name, Date.now());
+    } else if (pressed && prev && name === 'enter') {
+      const lastFire = t.directKeyLastFire.get(name) || 0;
+      if (Date.now() - lastFire >= ENTER_REPEAT_MS) {
+        dispatchKeyboardKey(t, name);
+        t.directKeyLastFire.set(name, Date.now());
+      }
+    }
     return res.status(200).json({ value: '00000000' });
   }
 
@@ -2454,7 +2483,7 @@ const PAGE = `<!doctype html>
   <h2>5. Simulated OS (same password)</h2>
   <div class="st" id="osmode">mode: AI text sender</div>
   <button id="osmodebtn" onclick="toggleOsMode()">Switch to OS mode</button>
-  <small>Default display transmitter: /out. Its pins are 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2. The four extra keyboard transmitters POST to /keys/1 through /keys/4 and never receive display output. All five use the same pass header.</small>
+  <small>Default display transmitter: /out. Its pins are 1 on/off, 2 down, 3 up, 4 select, 5 FN1, 6 FN2, and optional pin 7 ENTER. The four extra keyboard transmitters POST to /keys/1 through /keys/4 and never receive display output. All five use the same pass header.</small>
   <pre class="screen" id="osscreen">(AI mode)</pre>
   <div class="keys">
     <button onclick="osKey('power')">On/off (1)</button>
@@ -2471,7 +2500,7 @@ const PAGE = `<!doctype html>
   <div class="st" id="ospins"></div>
   <div class="st" id="osfs"></div>
   <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER, SPACE, BACKSPACE, dot, dash, slash on pins 1-8. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z, /key/enter (also /key/return), /key/space, /key/backspace, /key/dot, /key/dash, /key/slash with {&quot;pressed&quot;:true/false}. Only /out returns panel frames.<br><br>
-  <b>Menu:</b> UP/FN1 previous app, DOWN/FN2 next app, SELECT or keyboard ENTER opens.<br>
+  <b>Menu:</b> UP/FN1 previous app, DOWN/FN2 next app, SELECT or ENTER opens. ENTER works from /keys/4 pin 3 or optional main-transmitter pin 7.<br>
   <b>AI chat:</b> type with the keyboard (SPACE for spaces), ENTER sends to Groq, FN1 clears, FN2/BACKSPACE deletes, SELECT exits. Any key after an answer starts a new message; the conversation is remembered until you leave the app.<br>
   <b>Terminal:</b> type, ENTER runs. UP/DOWN browse command history, or flip pages when an answer is longer than the screen. FN1 clears the line, FN2/BACKSPACE deletes, SELECT exits. Type <code>help</code> for the list and <code>help ls</code> for a command's usage. Files: ls cd pwd cat mkdir touch rm cp mv write append edit wc head tail find grep tree df run. Others: echo time date ver about sys uptime whoami history rand roll flip add sub mul div mod pow upper reverse len clear exit off. Numbers are spelled as words (example: add five three).<br>
   <b>Text edit:</b> type, ENTER = new line, FN1 saves, FN2/BACKSPACE deletes, UP/DOWN read the file page by page, SELECT saves and exits. A new document asks for a file name when you save (use / for folders).<br>

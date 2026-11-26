@@ -226,6 +226,7 @@ function makeTransmitter(password) {
     keyBankPrev: new Map(),       // POST-only auxiliary keyboard banks
     directKeyPrev: new Map(),     // optional one-endpoint-per-key inputs
     keyBankLastFire: new Map(),   // repeat timing for keys in each keyboard bank
+    keyBankLastPost: new Map(),   // when each keyboard bank last POSTed
     directKeyLastFire: new Map(), // repeat timing for individual-key endpoints
     lastKeyboardKey: '',
     lastKeyboardRequest: null,
@@ -1051,6 +1052,16 @@ const WEB_KEYBOARD_KEYS = new Set(['enter', 'space', 'backspace']);
 // Some transmitter setups keep POSTing the pressed state and do not send a zero on release.
 // Enter gets a slow repeat fallback so it can be pressed again after opening an app.
 const ENTER_REPEAT_MS = 700;
+
+// Stuck-key protection (applies to EVERY key, not just Enter).
+// A key only types on a 0 -> 1 change. If a "released" POST is lost, arrives out of order, or
+// the transmitter never sends zeros, that key would look held forever and never type again.
+//   KEY_STALE_MS  : if a bank has been silent this long, forget its remembered state, so the
+//                   next press is always seen as a fresh press.
+//   KEY_REPEAT_MS : a key that stays at 1 this long is typed again (like keyboard auto-repeat).
+//                   Set to 0 to turn repeat off.
+const KEY_STALE_MS = 600;
+const KEY_REPEAT_MS = 900;
 
 // How many rows are redrawn while typing (small = fast) and for outputs/pages/replies.
 // The panel draws one character per poll, so keep INPUT_ROWS small.
@@ -2247,30 +2258,29 @@ function handleKeyboardEndpoint(req, res, routeName) {
       return res.status(200).json({ value: '00000000' });
     }
 
-    const prev = t.keyBankPrev.get(bank.id) || '00000000';
-    const rising = [];
+    const now = Date.now();
+    let prev = t.keyBankPrev.get(bank.id) || '00000000';
+    const lastPost = t.keyBankLastPost.get(bank.id) || 0;
+    if (lastPost && now - lastPost > KEY_STALE_MS) prev = '00000000';   // stale state: forget it
+    t.keyBankLastPost.set(bank.id, now);
+
+    const fire = [];
     for (let i = 0; i < 8; i++) {
-      if (bits[i] === '1' && prev[i] === '0' && bank.keys[i]) rising.push(bank.keys[i]);
+      const k = bank.keys[i];
+      if (!k || bits[i] !== '1') continue;
+      const fireKey = bank.id + ':' + k;
+      if (prev[i] === '0') {
+        fire.push(k);                                  // normal press (0 -> 1)
+      } else if (KEY_REPEAT_MS > 0 || k === 'enter') {
+        const gap = k === 'enter' && !(KEY_REPEAT_MS > 0) ? ENTER_REPEAT_MS : KEY_REPEAT_MS;
+        if (now - (t.keyBankLastFire.get(fireKey) || 0) >= gap) fire.push(k);   // held / missed release
+      }
     }
     t.keyBankPrev.set(bank.id, bits);
 
-    if (rising.length >= 1) {
-      for (const k of rising) {                       // every new key is typed, in pin order
-        dispatchKeyboardKey(t, k);
-        t.keyBankLastFire.set(bank.id + ':' + k, Date.now());
-      }
-    } else {
-      // Enter-only repeat fallback: handles transmitters that never POST the all-zero
-      // release state. Normal zero->one presses still work immediately.
-      const enterIndex = bank.keys.indexOf('enter');
-      if (enterIndex >= 0 && bits[enterIndex] === '1' && prev[enterIndex] === '1') {
-        const fireKey = bank.id + ':enter';
-        const lastFire = t.keyBankLastFire.get(fireKey) || 0;
-        if (Date.now() - lastFire >= ENTER_REPEAT_MS) {
-          dispatchKeyboardKey(t, 'enter');
-          t.keyBankLastFire.set(fireKey, Date.now());
-        }
-      }
+    for (const k of fire) {                            // every key is typed, in pin order
+      dispatchKeyboardKey(t, k);
+      t.keyBankLastFire.set(bank.id + ':' + k, now);
     }
     return res.status(200).json({ value: '00000000' });
   }
@@ -2289,9 +2299,10 @@ function handleKeyboardEndpoint(req, res, routeName) {
     if (pressed && !prev) {
       dispatchKeyboardKey(t, name);
       t.directKeyLastFire.set(name, Date.now());
-    } else if (pressed && prev && name === 'enter') {
+    } else if (pressed && prev && (name === 'enter' || KEY_REPEAT_MS > 0)) {
       const lastFire = t.directKeyLastFire.get(name) || 0;
-      if (Date.now() - lastFire >= ENTER_REPEAT_MS) {
+      const gap = KEY_REPEAT_MS > 0 ? KEY_REPEAT_MS : ENTER_REPEAT_MS;
+      if (Date.now() - lastFire >= gap) {
         dispatchKeyboardKey(t, name);
         t.directKeyLastFire.set(name, Date.now());
       }

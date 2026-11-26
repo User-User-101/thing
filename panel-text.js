@@ -1923,6 +1923,20 @@ function keyboardEnter(t) {
   os.lastKey = 'enter';
   t.lastKeyboardKey = 'ENTER';
 
+  // ENTER is also the confirm key on the app menu. It was previously ignored there.
+  if (os.app === 'menu') {
+    menuKey(t, 'select');
+    redrawOS(t);
+    noteAction(t, 'keyboard ENTER opened ' + os.app);
+    return true;
+  }
+  if (os.app === 'clok' || os.app === 'dice') {
+    appKey(t, 'select');
+    redrawOS(t);
+    noteAction(t, 'keyboard ENTER (' + os.app + ')');
+    return true;
+  }
+
   if (os.app === 'term') {
     runCommand(t);
     if (t.os.power) redrawOS(t); // 'off' must leave the clear frame intact
@@ -1972,7 +1986,14 @@ function keyboardEnter(t) {
   return false;
 }
 
+function normalizeKeyboardKey(key) {
+  const value = String(key ?? '').trim().toLowerCase();
+  if (value === 'return' || value === 'confirm' || value === 'submit') return 'enter';
+  return value;
+}
+
 function dispatchKeyboardKey(t, key) {
+  key = normalizeKeyboardKey(key);
   if (key === 'enter') return keyboardEnter(t);
   if (key === 'backspace') return keyboardBackspace(t);
   return keyboardChar(t, Object.prototype.hasOwnProperty.call(KEY_CHARS, key) ? KEY_CHARS[key] : key);
@@ -2032,7 +2053,7 @@ function handleKeyboardEndpoint(req, res, routeName) {
   const t = inputPanel(req, res);
   if (!t) return;
 
-  const name = String(routeName || '').toLowerCase();
+  const name = normalizeKeyboardKey(routeName);
   const bank = KEY_BANKS.find((item) => item.id === name);
 
   if (bank) {
@@ -2248,7 +2269,7 @@ app.post('/api/os/mode', (req, res) => {
 // Press an OS key from the page (same as the matching pin from the game).
 app.post('/api/os/key', (req, res) => {
   const t = req.transmitter;
-  const key = String(req.body.key || '');
+  const key = normalizeKeyboardKey(req.body.key || '');
   if (!OS_PINS.includes(key) && !WEB_KEYBOARD_KEYS.has(key)) return res.status(400).json({ error: 'Unknown key.' });
   if (t.mode !== 'os') return res.status(409).json({ error: 'Switch this transmitter to OS mode first.' });
   if (WEB_KEYBOARD_KEYS.has(key)) dispatchKeyboardKey(t, key);
@@ -2449,8 +2470,8 @@ const PAGE = `<!doctype html>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
   <div class="st" id="osfs"></div>
-  <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER, SPACE, BACKSPACE, dot, dash, slash on pins 1-8. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z, /key/enter, /key/space, /key/backspace, /key/dot, /key/dash, /key/slash with {&quot;pressed&quot;:true/false}. Only /out returns panel frames.<br><br>
-  <b>Menu:</b> UP/FN1 previous app, DOWN/FN2 next app, SELECT opens.<br>
+  <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER, SPACE, BACKSPACE, dot, dash, slash on pins 1-8. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z, /key/enter (also /key/return), /key/space, /key/backspace, /key/dot, /key/dash, /key/slash with {&quot;pressed&quot;:true/false}. Only /out returns panel frames.<br><br>
+  <b>Menu:</b> UP/FN1 previous app, DOWN/FN2 next app, SELECT or keyboard ENTER opens.<br>
   <b>AI chat:</b> type with the keyboard (SPACE for spaces), ENTER sends to Groq, FN1 clears, FN2/BACKSPACE deletes, SELECT exits. Any key after an answer starts a new message; the conversation is remembered until you leave the app.<br>
   <b>Terminal:</b> type, ENTER runs. UP/DOWN browse command history, or flip pages when an answer is longer than the screen. FN1 clears the line, FN2/BACKSPACE deletes, SELECT exits. Type <code>help</code> for the list and <code>help ls</code> for a command's usage. Files: ls cd pwd cat mkdir touch rm cp mv write append edit wc head tail find grep tree df run. Others: echo time date ver about sys uptime whoami history rand roll flip add sub mul div mod pow upper reverse len clear exit off. Numbers are spelled as words (example: add five three).<br>
   <b>Text edit:</b> type, ENTER = new line, FN1 saves, FN2/BACKSPACE deletes, UP/DOWN read the file page by page, SELECT saves and exits. A new document asks for a file name when you save (use / for folders).<br>

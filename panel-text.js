@@ -1,8 +1,9 @@
-// Groq-powered panel sender + simulated OS with a separate POST-only keyboard.
+// Groq-powered panel sender + simulated OS (v1.4) with a separate POST-only keyboard,
+// a persistent simulated filesystem, a file manager and a much bigger terminal.
 //
 // DISPLAY TRANSMITTER (the only transmitter that receives display output):
 //   URL:    https://YOUR-TUNNEL-URL/out
-//   Method: GET or POST (existing behavior)
+//   Method: GET or POST
 //   Header: {"pass":"YOUR_PANEL_PASSWORD"}
 //   This transmitter alone receives {"value":"........"} display frames.
 //
@@ -10,28 +11,20 @@
 //   /keys/1  pins 1-8 = A B C D E F G H
 //   /keys/2  pins 1-8 = I J K L M N O P
 //   /keys/3  pins 1-8 = Q R S T U V W X
-//   /keys/4  pin 1 = Y, pin 2 = Z, pin 3 = ENTER (pins 4-8 unused)
+//   /keys/4  pins 1-8 = Y Z ENTER SPACE BACKSPACE . - /      (NEW: SPACE, BACKSPACE, dot, dash, slash)
 // Each key is an independent input pin. Send the current 8-pin state in a POST body,
 // e.g. {"value":"10000000"}; arrays and bare bit strings are also accepted.
-// Bank endpoints answer HTTP 200 JSON for compatibility and never return display frames.
-// The server reacts only to 0 -> 1 transitions.
-// All four keyboard transmitters use the SAME pass header as the display transmitter,
-// so every key controls that panel's currently open OS application. Their responses
-// are HTTP 204 with no body: they never return display frames.
+// The server reacts only to 0 -> 1 transitions, so POST all zeros when the keys are released.
+// All keyboard transmitters use the SAME pass header as the display transmitter.
 //
-// There are also individual POST endpoints /key/a through /key/z and /key/enter.
-// These accept {"pressed":true/false}, or an 8-bit value with any pin high on press. They are
-// an optional one-key-per-transmitter alternative; the four pin banks are the efficient
-// setup and require only four auxiliary transmitters. If you choose the individual
-// one-key endpoints literally (one device/URL per letter plus Enter), that is 27 input
-// transmitters plus the display transmitter = 28 total.
+// Individual POST endpoints also exist: /key/a ... /key/z, /key/enter, /key/space,
+// /key/backspace, /key/dot, /key/dash, /key/slash with {"pressed":true/false}.
 //
 // RECOMMENDED TOTAL: 1 display transmitter + 4 keyboard banks = 5 transmitters.
-// The server accepts the alphabet/Enter keys only while the default panel is in OS
-// mode and powered on. Text is routed to the open terminal, text editor, or AI chat app.
 //
-// FN1 and FN2 now have app-specific actions; they are no longer used as a shared
-// character picker. See the OS section and the web page for each app's key meanings.
+// FILESYSTEM: every password has its own small filesystem, saved as JSON on the computer
+// that runs this script (default: panel-data.json next to the script; change it with
+// PANEL_DATA=/some/path.json). Passwords are stored only as a SHA-256 hash.
 //
 // Setup:
 //   npm install express
@@ -39,10 +32,12 @@
 //   or: GROQ_API_KEY=gsk_... node panel-text-keyboard.js
 //   cloudflared tunnel --url http://localhost:3000   (or ngrok http 3000)
 //
-// Existing AI text sender, Groq prompt, output encoding and display queue are retained.
 // Output format: X S C5 C4 C3 C2 C1 C0; clear='10000000', idle='00000000'.
 
 const express = require('express');
+const nodeFs = require('fs');
+const nodePath = require('path');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -100,13 +95,12 @@ const CLEAR_SETTLE = 1;
 const SHOW_INPUT = true;
 
 // How many characters fit on ONE row of your panel before it wraps. The OS also uses
-// this as its screen width. 16 = a grid of 16 characters per row (16 rows). If that is wrong: send "abcdefghijklmnop" from Manual tools,
+// this as its screen width. If that is wrong: send "abcdefghijklmnop" from Manual tools,
 // count the letters on the first row, and put that number here.
 const CHARS_PER_ROW = 16;
 
 // If your in-game panel has a code that moves the cursor to the next line,
 // put it here (0-127) and padding is skipped. Leave null otherwise.
-// The fast circuit uses 127 (all seven code pins high = new line): set NEWLINE_CODE = 127.
 // A row that is exactly full is not followed by a new-line code (the panel wraps by itself).
 const NEWLINE_CODE = null;
 
@@ -136,8 +130,7 @@ const SPACE_CODE = 63;
 // Flip if the game reads the 8-bit string in the opposite direction
 const REVERSE_BITS = false;
 
-// Set true if a PRESSED button reads as 0 instead of 1 (active-low wiring). The pins
-// are inverted after padding, so a press still shows up as a 0 -> 1 rising edge.
+// Set true if a PRESSED button reads as 0 instead of 1 (active-low wiring).
 const PINS_ACTIVE_LOW = false;
 
 // ---- AI-mode control pins, read from the value the transmitter POSTs to /out ----
@@ -190,12 +183,28 @@ const SHORTEN_PROMPT =
   'That answer was cut off or too long. Reply again with the complete answer in under 48 characters. ' +
   'Keep complete words and complete sentences; shorten the wording instead of cutting anything off.';
 
+// The OS "ai chat" app has a bigger screen (several rows), so it may answer a bit longer.
+const OS_PERSONA =
+  'You write replies for a small text screen that is 16 characters wide and a few rows tall. ' +
+  'You are continuing a conversation, so use earlier turns when they help. ';
+
+const OS_RULES =
+  'Always finish your reply: write complete words and complete sentences, never stop mid-word or mid-sentence. ' +
+  'Answer the latest user message briefly: one or two short sentences, never more than 100 characters. ' +
+  'Reply with plain text: no emojis, no markdown, no quotes, no lists, no explanations. ' +
+  'Use only letters, digits, spaces and the characters . , ! ? - = / : ; ( ) + _ \' and accented letters.';
+
+const OS_SHORTEN_PROMPT =
+  'That answer was cut off or too long. Reply again with the complete answer in under 100 characters. ' +
+  'Keep complete words and complete sentences; shorten the wording instead of cutting anything off.';
+
 // ======================= TRANSMITTERS =======================
 //
 // One transmitter per distinct "pass" header value.
 
 const transmitters = new Map(); // password -> transmitter
 const TRANSMITTER_IDLE_MS = 12 * 60 * 60 * 1000; // drop transmitters untouched for 12 h
+// (The saved filesystem is NOT dropped with the transmitter; it lives in the data file.)
 
 function makeTransmitter(password) {
   return {
@@ -224,6 +233,7 @@ function makeTransmitter(password) {
     // ---- mode: 'ai' (Groq text sender) or 'os' (simulated OS) ----
     mode: DEFAULT_MODE,
     os: makeOS(),
+    fsKey: '',
 
     // ---- conversation ----
     history: [],
@@ -536,8 +546,7 @@ function outHandler(req, res) {
   } else {
     // A poll with no input payload is the transmitter's released/idle state.
     // Reset only the edge-detection baseline: do NOT call osKey and do NOT
-    // interpret this as a falling-edge press. This re-arms every key so the same
-    // physical button can be pressed again on the next POST.
+    // interpret this as a falling-edge press.
     t.prevIn = '00000000';
     t.lastIn = '00000000';
   }
@@ -545,11 +554,9 @@ function outHandler(req, res) {
   if (t.held !== null) return res.json({ value: t.held });
 
   // A transmitter POST both delivers the button state and receives the next display
-  // frame. Do not send the clear pulse in that same response: some transmitter setups
-  // apply the response before their button-state update has settled. Return one idle
-  // frame for the input poll, leaving the clear + redraw sequence at the front of the
-  // queue for the NEXT poll. The web-page buttons already use a separate request and
-  // therefore continue to receive the clear frame on their next normal poll.
+  // frame. Do not send the clear pulse in that same response: return one idle frame for
+  // the input poll, leaving the clear + redraw sequence at the front of the queue for
+  // the NEXT poll.
   if (osButtonHandled) {
     const frame = blank();
     t.last = frame;
@@ -599,18 +606,22 @@ function cleanReply(text) {
 }
 
 // Last-resort length cap. Cuts at a word boundary so a word is never split.
-function finalizeReply(text) {
+function finalizeReply(text, hard = REPLY_HARD_CHARS) {
   let t = cleanReply(text);
-  if (t.length <= REPLY_HARD_CHARS) return t;
-  let cut = t.slice(0, REPLY_HARD_CHARS);
+  if (t.length <= hard) return t;
+  let cut = t.slice(0, hard);
   const space = cut.lastIndexOf(' ');
   if (space > 0) cut = cut.slice(0, space);
   return cut.trim();
 }
 
-function currentSystemPrompt(t) {
-  const persona = t.customPrompt !== null ? t.customPrompt : DEFAULT_PERSONA;
-  if (t.customPrompt === null || t.appendRules) return persona.trim() + ' ' + PANEL_RULES;
+// Two chat styles: the one-line AI mode, and the roomier OS "ai chat" app.
+const PANEL_CHAT = { persona: DEFAULT_PERSONA, rules: PANEL_RULES, hardChars: REPLY_HARD_CHARS, shorten: SHORTEN_PROMPT };
+const OS_CHAT = { persona: OS_PERSONA, rules: OS_RULES, hardChars: 110, shorten: OS_SHORTEN_PROMPT };
+
+function currentSystemPrompt(t, style = PANEL_CHAT) {
+  const persona = t.customPrompt !== null ? t.customPrompt : style.persona;
+  if (t.customPrompt === null || t.appendRules) return persona.trim() + ' ' + style.rules;
   return persona.trim();
 }
 
@@ -646,9 +657,9 @@ async function groqCall(messages, maxTokens = COMPLETION_TOKENS) {
   };
 }
 
-async function askGroq(t, message, hist = t.history) {
+async function askGroq(t, message, hist = t.history, style = PANEL_CHAT) {
   const base = [
-    { role: 'system', content: currentSystemPrompt(t) },
+    { role: 'system', content: currentSystemPrompt(t, style) },
     ...hist,
     { role: 'user', content: message },
   ];
@@ -661,10 +672,10 @@ async function askGroq(t, message, hist = t.history) {
   while (attempts <= RETRY_LIMIT) {
     const { content, finishReason } = await groqCall(messages);
     lastContent = content;
-    const clean = finalizeReply(content);
+    const clean = finalizeReply(content, style.hardChars);
 
     const cutByTokens = finishReason === 'length';
-    const tooLong = clean.length > REPLY_HARD_CHARS || content.length > REPLY_HARD_CHARS;
+    const tooLong = clean.length > style.hardChars || content.length > style.hardChars;
 
     if (!cutByTokens && !tooLong && clean) {
       return clean; // complete and within bounds
@@ -676,7 +687,7 @@ async function askGroq(t, message, hist = t.history) {
     messages = [
       ...base,
       { role: 'assistant', content: content || '(no visible text)' },
-      { role: 'user', content: SHORTEN_PROMPT },
+      { role: 'user', content: style.shorten },
     ];
 
     if (cutByTokens) {
@@ -684,7 +695,7 @@ async function askGroq(t, message, hist = t.history) {
     }
   }
 
-  const clean = finalizeReply(lastContent);
+  const clean = finalizeReply(lastContent, style.hardChars);
   if (!clean) throw new Error('Model returned no usable text. Try again.');
   return clean;
 }
@@ -745,53 +756,273 @@ async function runChat(t, message, redo = false) {
   return { reply };
 }
 
-// Ask the AI for the OS "ai chat" app: puts the reply + hint on the panel.
+// ======================= FILESYSTEM (saved on the PC running this script) =======================
+//
+// One small filesystem per password. Nodes:
+//   dir : { type:'dir',  children:{ name: node }, mtime }
+//   file: { type:'file', content:'text', mtime }
+// Everything is kept in memory and written to DATA_FILE a moment after each change.
+
+const DATA_FILE = process.env.PANEL_DATA || nodePath.join(__dirname, 'panel-data.json');
+const FS_MAX_FILE_CHARS = 4000;     // per file
+const FS_MAX_TOTAL_CHARS = 200000;  // per panel
+const FS_MAX_NODES = 300;           // files + folders per panel
+const FS_MAX_DEPTH = 8;
+
+const filesystems = new Map();      // sha256(password) -> root dir node
+let saveTimer = null;
+
+const isDirNode = (n) => !!n && n.type === 'dir' && !!n.children && typeof n.children === 'object';
+
+function loadStore() {
+  try {
+    const data = JSON.parse(nodeFs.readFileSync(DATA_FILE, 'utf8'));
+    const all = (data && data.filesystems) || {};
+    for (const key of Object.keys(all)) if (isDirNode(all[key])) filesystems.set(key, all[key]);
+    console.log('Filesystem: loaded ' + filesystems.size + ' saved panel(s) from ' + DATA_FILE);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      console.log('Filesystem: ' + DATA_FILE + ' will be created on the first change.');
+    } else {
+      console.error('Filesystem: could not read ' + DATA_FILE + ' (' + e.message + '). Keeping a copy as .bad');
+      try { nodeFs.renameSync(DATA_FILE, DATA_FILE + '.bad'); } catch (_) {}
+    }
+  }
+}
+
+function saveNow() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  try {
+    const tmp = DATA_FILE + '.tmp';
+    nodeFs.writeFileSync(tmp, JSON.stringify({ version: 1, filesystems: Object.fromEntries(filesystems) }));
+    nodeFs.renameSync(tmp, DATA_FILE);
+  } catch (e) {
+    console.error('Filesystem: could not save ' + DATA_FILE + ': ' + e.message);
+  }
+}
+
+function scheduleSave() {
+  if (!saveTimer) saveTimer = setTimeout(saveNow, 400);
+}
+
+process.on('exit', () => { if (saveTimer) saveNow(); });
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
+
+function newFsRoot() {
+  const now = Date.now();
+  return {
+    type: 'dir', mtime: now,
+    children: { 'readme.txt': { type: 'file', mtime: now, content: 'welcome to bldos. open the terminal and type help.' } },
+  };
+}
+
+function fsRoot(t) {
+  if (!t.fsKey) t.fsKey = crypto.createHash('sha256').update('panel-fs:' + t.password).digest('hex').slice(0, 32);
+  let root = filesystems.get(t.fsKey);
+  if (!root) {
+    root = newFsRoot();
+    filesystems.set(t.fsKey, root);
+    scheduleSave();
+  }
+  return root;
+}
+
+const validName = (n) => /^[a-z0-9][a-z0-9._-]{0,23}$/.test(String(n));
+
+function childOf(dir, name) {
+  return Object.prototype.hasOwnProperty.call(dir.children, name) ? dir.children[name] : null;
+}
+
+// Turn a path (absolute or relative to cwd) into a list of names. '.' and '..' are resolved.
+function splitPath(cwd, p) {
+  p = String(p || '');
+  const segs = p.startsWith('/') ? [] : String(cwd).split('/').filter(Boolean);
+  for (const part of p.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') segs.pop();
+    else segs.push(part);
+  }
+  return segs;
+}
+const pathStr = (segs) => '/' + segs.join('/');
+
+function lookup(root, segs) {
+  let n = root;
+  for (const s of segs) {
+    if (!n || n.type !== 'dir') return null;
+    n = childOf(n, s);
+  }
+  return n || null;
+}
+
+function sortedNames(dir) {
+  return Object.keys(dir.children).sort((a, b) =>
+    ((dir.children[b].type === 'dir') - (dir.children[a].type === 'dir')) || a.localeCompare(b));
+}
+
+function fsStats(root) {
+  let nodes = 0;
+  let chars = 0;
+  (function walk(dir) {
+    for (const name of Object.keys(dir.children)) {
+      const c = dir.children[name];
+      nodes++;
+      if (c.type === 'dir') walk(c); else chars += (c.content || '').length;
+    }
+  })(root);
+  return { nodes, chars };
+}
+
+// Split an absolute path into parent dir + new/existing name. Returns { err } on failure.
+function fsSplit(t, p) {
+  const segs = splitPath('/', p);
+  if (!segs.length) return { err: 'is root' };
+  const name = segs[segs.length - 1];
+  if (!validName(name)) return { err: 'bad name' };
+  if (segs.length > FS_MAX_DEPTH) return { err: 'too deep' };
+  const parent = lookup(fsRoot(t), segs.slice(0, -1));
+  if (!parent) return { err: 'no such dir' };
+  if (parent.type !== 'dir') return { err: 'not a dir' };
+  return { segs, name, parent };
+}
+
+// All fs* functions return null on success or a short error string.
+function fsWriteFile(t, p, content) {
+  const s = fsSplit(t, p);
+  if (s.err) return s.err;
+  const ex = childOf(s.parent, s.name);
+  if (ex && ex.type === 'dir') return 'is a dir';
+  const text = String(content);
+  if (text.length > FS_MAX_FILE_CHARS) return 'file too big';
+  const st = fsStats(fsRoot(t));
+  if (!ex && st.nodes >= FS_MAX_NODES) return 'fs full';
+  if (st.chars - (ex ? ex.content.length : 0) + text.length > FS_MAX_TOTAL_CHARS) return 'fs full';
+  if (ex) { ex.content = text; ex.mtime = Date.now(); }
+  else s.parent.children[s.name] = { type: 'file', content: text, mtime: Date.now() };
+  scheduleSave();
+  return null;
+}
+
+function fsMkdir(t, p) {
+  const s = fsSplit(t, p);
+  if (s.err) return s.err;
+  if (childOf(s.parent, s.name)) return 'exists';
+  if (fsStats(fsRoot(t)).nodes >= FS_MAX_NODES) return 'fs full';
+  s.parent.children[s.name] = { type: 'dir', children: {}, mtime: Date.now() };
+  scheduleSave();
+  return null;
+}
+
+function fsRemove(t, p, recursive) {
+  const s = fsSplit(t, p);
+  if (s.err) return s.err === 'bad name' ? 'no such file' : s.err;
+  const ex = childOf(s.parent, s.name);
+  if (!ex) return 'no such file';
+  if (ex.type === 'dir' && !recursive && Object.keys(ex.children).length) return 'not empty (use -r)';
+  delete s.parent.children[s.name];
+  scheduleSave();
+  return null;
+}
+
+function fsCopy(t, from, to) {
+  const root = fsRoot(t);
+  const fromSegs = splitPath('/', from);
+  const src = lookup(root, fromSegs);
+  if (!src) return 'no such file';
+  if (src.type !== 'file') return 'is a dir';
+  const toSegs = splitPath('/', to);
+  const dest = lookup(root, toSegs);
+  const target = dest && dest.type === 'dir' ? toSegs.concat(fromSegs.slice(-1)) : toSegs;
+  return fsWriteFile(t, pathStr(target), src.content);
+}
+
+function fsMove(t, from, to) {
+  const root = fsRoot(t);
+  const fromSegs = splitPath('/', from);
+  if (!fromSegs.length) return 'is root';
+  const src = lookup(root, fromSegs);
+  if (!src) return 'no such file';
+  const toSegs0 = splitPath('/', to);
+  const dest = lookup(root, toSegs0);
+  const toSegs = dest && dest.type === 'dir' ? toSegs0.concat(fromSegs.slice(-1)) : toSegs0;
+  if (toSegs.length >= fromSegs.length && fromSegs.every((s, i) => toSegs[i] === s)) return 'bad move';
+  const a = fsSplit(t, pathStr(toSegs));
+  if (a.err) return a.err;
+  if (childOf(a.parent, a.name)) return 'exists';
+  const b = fsSplit(t, pathStr(fromSegs));
+  if (b.err) return b.err;
+  a.parent.children[a.name] = src;
+  delete b.parent.children[b.name];
+  scheduleSave();
+  return null;
+}
+
+// ======================= AI CHAT (OS app) =======================
+
+// Ask the AI for the OS "ai chat" app. Draws "thinking...", then the reply (or an error
+// message), and never throws. The typed draft is kept until an answer arrives.
 async function runOsChat(t, message) {
   const myGen = ++t.chatGen;
   t.chatBusy = true;
-  let reply;
+  t.os.ai.shown = false;
+  t.os.ai.text = '';
+  t.os.ai.notice = 'thinking...';
+  redrawOS(t);
+
+  let reply = '';
+  let error = '';
   try {
-    reply = await askGroq(t, message);
+    reply = await askGroq(t, message, t.history, OS_CHAT);
+  } catch (e) {
+    error = e.message || 'unknown error';
   } finally {
     if (myGen === t.chatGen) t.chatBusy = false;
   }
   if (myGen !== t.chatGen) return { interrupted: true };
-  if (t.mode !== 'os' || t.os.app !== 'ai' || !t.os.power) return { interrupted: true };
+  const os = t.os;
+  if (t.mode !== 'os' || !os.power || os.app !== 'ai') return { interrupted: true };
 
+  if (error) {
+    os.ai.notice = 'error: ' + cleanReply(error).slice(0, 70);
+    redrawOS(t);
+    noteAction(t, 'AI chat failed: ' + error);
+    console.error('AI chat failed:', error);
+    return { error };
+  }
   pushHistory(t, 'user', message);
   pushHistory(t, 'assistant', reply);
   t.lastUserMessage = message;
-  t.os.ai.draft = '';
-
-  const display = padToRow(cleanReply(reply)) + '(click select to exit)';
-  osAiDraw(t, display);
-  t.os.ai.shown = true;
-  t.os.ai.text = display;   // remember the full multi-row text so a key press can redraw it
+  os.ai.notice = '';
+  os.ai.draft = '';
+  os.ai.text = reply;
+  os.ai.shown = true;
+  redrawOS(t);
   return { reply };
 }
 
 // ======================= SIMULATED OS =======================
 //
-// The default /out transmitter handles the OS controls:
+// The /out transmitter handles the OS controls:
 //   pin 1 POWER, pin 2 DOWN, pin 3 UP, pin 4 SELECT, pin 5 FN1, pin 6 FN2.
-// The four separate /keys/N POST transmitters handle alphabet + ENTER input.
-// Letters are routed into whichever of terminal, text edit, or AI chat is open.
+// The four /keys/N POST transmitters handle typing (letters, ENTER, SPACE, BACKSPACE, . - /).
 // A keyboard bank reacts only to rising edges, so POST an all-zero state on release.
 //
-// FN1 / FN2 are app-specific:
-//   menu:     FN1 previous app, FN2 next app
-//   terminal: FN1 inserts a space, FN2 clears the command line
-//   text edit:FN1 inserts a space, FN2 backspaces
-//   AI chat:  FN1 inserts a space, FN2 backspaces
-//   clock:    FN1 toggles time/date, FN2 toggles 12/24-hour format
-//   dice:     FN1 rolls, FN2 selects the next die size
-// ENTER is handled by the auxiliary keyboard: terminal runs, text edit saves,
-// and AI chat sends the typed message to Groq.
+// Apps (menu: UP/FN1 previous, DOWN/FN2 next, SELECT opens):
+//   ai chat   letters/SPACE type, ENTER sends, FN1 clears, FN2 = backspace, SELECT exits
+//   terminal  letters/SPACE type, ENTER runs, UP/DOWN = history (or output pages),
+//             FN1 clears the line, FN2 = backspace, SELECT exits
+//   text edit letters/SPACE type, ENTER = new line, FN1 saves, FN2 = backspace,
+//             UP/DOWN read the file page by page, SELECT saves and exits
+//   files     UP/DOWN move, SELECT/ENTER opens, FN1 = back (or exit), FN2 = new file,
+//             letters jump to the next name starting with that letter
+//   clock     FN1 time/date, FN2 12/24-hour
+//   dice      FN1 rolls, FN2 (or UP/DOWN) changes the die
 
 // New transmitters start in this mode ('os' or 'ai'). Use PANEL_MODE=ai to start in AI mode.
 const DEFAULT_MODE = String(process.env.PANEL_MODE || '').toLowerCase() === 'ai' ? 'ai' : 'os';
 
-const OS_VERSION = '1.3';
+const OS_VERSION = '1.4';
 const OS_PINS = ['power', 'down', 'up', 'select', 'fn1', 'fn2']; // main transmitter pins 1-6
 const OS_DEBOUNCE_MS = 40;
 const POWER_ON_FALLING_EDGE = false;
@@ -800,6 +1031,7 @@ const APPS = [
   { id: 'ai', name: 'ai chat' },
   { id: 'term', name: 'terminal' },
   { id: 'edit', name: 'text edit' },
+  { id: 'files', name: 'files' },
   { id: 'clok', name: 'clock' },
   { id: 'dice', name: 'dice' },
 ];
@@ -809,12 +1041,26 @@ const KEY_BANKS = [
   { id: '1', keys: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] },
   { id: '2', keys: ['i', 'j', 'k', 'l', 'm', 'n', 'o', 'p'] },
   { id: '3', keys: ['q', 'r', 's', 't', 'u', 'v', 'w', 'x'] },
-  { id: '4', keys: ['y', 'z', 'enter', null, null, null, null, null] },
+  { id: '4', keys: ['y', 'z', 'enter', 'space', 'backspace', 'dot', 'dash', 'slash'] },
 ];
-const EDITOR_MAX = 120;
-const TERM_MAX = EDITOR_MAX;
+const KEY_CHARS = { space: ' ', dot: '.', dash: '-', slash: '/' };
+const WEB_KEYBOARD_KEYS = new Set(['enter', 'space', 'backspace']);
+
+// How many rows are redrawn while typing (small = fast) and for outputs/pages/replies.
+// The panel draws one character per poll, so keep INPUT_ROWS small.
+const INPUT_ROWS = 2;
+const OUTPUT_ROWS = 8;
+
+const EDITOR_MAX = FS_MAX_FILE_CHARS;
+const TERM_MAX = 120;
 const AI_DRAFT_MAX = 300;
+const HIST_MAX = 20;
 const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
+
+const newTerm = () => ({ buf: '', out: null, page: 0, cwd: '/', hist: [], histIdx: -1 });
+const newEditor = () => ({ path: null, text: '', dirty: false, saveAs: null, scroll: null, returnTo: 'menu', notice: '' });
+const newFiles = () => ({ cwd: '/', cursor: 0, newName: null, notice: '' });
+const newAi = () => ({ shown: false, text: '', draft: '', notice: '' });
 
 function makeOS() {
   return {
@@ -825,95 +1071,198 @@ function makeOS() {
     screen: '',
     lastKey: '',
     debounce: {},
-    term: { buf: '', out: null },
-    editor: { text: '' },
+    term: newTerm(),
+    editor: newEditor(),
+    files: newFiles(),
     clock: { showDate: false, use24h: true },
     dice: { side: 1, result: null },
-    ai: { shown: false, text: '', draft: '' },
+    ai: newAi(),
   };
 }
 
 const pad2 = (v) => String(v).padStart(2, '0');
 const rollDie = (os) => 1 + Math.floor(Math.random() * DICE_SIDES[os.dice.side]);
 
-// Pad a line so a following line starts on a new row (the panel wraps by itself).
-function padToRow(text) {
-  const len = Array.from(text).length;
-  if (len === 0) return text;
-  const pad = (CHARS_PER_ROW - (len % CHARS_PER_ROW)) % CHARS_PER_ROW;
-  return text + ' '.repeat(pad);
+// ---- screen layout: text -> rows of at most CHARS_PER_ROW characters ----
+
+// Word wrap (used for AI replies and short notices).
+function wrapWords(text) {
+  const rows = [];
+  let cur = '';
+  for (let word of String(text).split(' ')) {
+    while (word.length > CHARS_PER_ROW) {
+      if (cur) { rows.push(cur); cur = ''; }
+      rows.push(word.slice(0, CHARS_PER_ROW));
+      word = word.slice(CHARS_PER_ROW);
+    }
+    if (!word) continue;
+    if (!cur) cur = word;
+    else if ((cur + ' ' + word).length <= CHARS_PER_ROW) cur += ' ' + word;
+    else { rows.push(cur); cur = word; }
+  }
+  if (cur) rows.push(cur);
+  return rows.length ? rows : [''];
 }
 
-// The one line the current app wants on the screen.
-function osLine(t) {
+// Hard wrap, keeps spaces and respects '\n' (used for typing and terminal output).
+function layoutRows(text) {
+  const rows = [];
+  for (const line of String(text).split('\n')) {
+    const chars = Array.from(line);
+    if (!chars.length) rows.push('');
+    for (let i = 0; i < chars.length; i += CHARS_PER_ROW) rows.push(chars.slice(i, i + CHARS_PER_ROW).join(''));
+  }
+  return rows;
+}
+
+const tailRows = (text, limit) => layoutRows(text).slice(-limit);
+const fit = (text) => String(text).slice(0, CHARS_PER_ROW);
+
+// Split text into pages of OUTPUT_ROWS rows. headerFn(page, pages) adds a header row;
+// without one, a "1/3 up/down" footer row is added when there is more than one page.
+function pagedRows(text, page, headerFn) {
+  const all = layoutRows(text);
+  let per = OUTPUT_ROWS - (headerFn ? 1 : 0);
+  let pages = Math.max(1, Math.ceil(all.length / per));
+  const footer = !headerFn && pages > 1;
+  if (footer) {
+    per = OUTPUT_ROWS - 1;
+    pages = Math.max(1, Math.ceil(all.length / per));
+  }
+  const p = Math.min(Math.max(page | 0, 0), pages - 1);
+  const rows = all.slice(p * per, (p + 1) * per);
+  if (headerFn) rows.unshift(headerFn(p + 1, pages));
+  if (footer) rows.push((p + 1) + '/' + pages + ' up/down');
+  return { rows, page: p, pages };
+}
+
+// Codes that move the cursor from the end of a row (len characters used) to the next row.
+function rowBreak(len) {
+  if (NEWLINE_CODE !== null) return len === CHARS_PER_ROW ? [] : [NEWLINE_CODE & 127];
+  return Array(Math.max(0, CHARS_PER_ROW - len)).fill(SPACE_CODE);
+}
+
+function codesForRows(rows) {
+  const codes = [];
+  rows.forEach((row, i) => {
+    const chars = Array.from(row);
+    codes.push(...chars.map(encode));
+    if (i < rows.length - 1) codes.push(...rowBreak(chars.length));
+  });
+  return codes;
+}
+
+// Clear the panel, then draw the rows. Replaces whatever was still being drawn.
+function osShow(t, rows) {
+  const shown = rows.slice(0, 16);
+  t.os.screen = shown.join('\n');
+  t.queue = [];
+  t.queue.push(...clearFrames());
+  t.queue.push(...buildFrames(t, codesForRows(shown)));
+}
+
+// ---- what each app shows ----
+
+function fmEntries(t) {
+  const fm = t.os.files;
+  let dir = lookup(fsRoot(t), splitPath('/', fm.cwd));
+  if (!dir || dir.type !== 'dir') { fm.cwd = '/'; dir = fsRoot(t); }
+  const list = [];
+  if (fm.cwd !== '/') list.push({ name: '..', type: 'dir', up: true });
+  for (const name of sortedNames(dir)) list.push({ name, type: dir.children[name].type });
+  return list;
+}
+
+function osRows(t) {
   const os = t.os;
   switch (os.app) {
     case 'menu':
-      return '▶ ' + APPS[os.cursor].name + ' ' + (os.cursor + 1) + '/' + APPS.length;
+      return layoutRows('▶ ' + APPS[os.cursor].name + ' ' + (os.cursor + 1) + '/' + APPS.length);
+
     case 'term': {
       const tm = os.term;
-      if (tm.out !== null) return tm.out;
-      return '# ' + Array.from(tm.buf).slice(-(CHARS_PER_ROW - 2)).join('') + '_';
+      if (tm.out !== null) {
+        const v = pagedRows(tm.out, tm.page);
+        tm.page = v.page;
+        return v.rows;
+      }
+      const shortCwd = tm.cwd.length > 8 ? '..' + tm.cwd.slice(-6) : tm.cwd;
+      return tailRows(shortCwd + '# ' + tm.buf + '_', INPUT_ROWS);
     }
+
     case 'edit': {
-      const visibleText = Array.from(os.editor.text).slice(-(CHARS_PER_ROW - 6)).join('');
-      return 'EDIT:' + visibleText + '_';
+      const ed = os.editor;
+      if (ed.saveAs !== null) return tailRows('save as: ' + ed.saveAs + '_', INPUT_ROWS);
+      if (ed.notice) return wrapWords(ed.notice);
+      const label = ed.path ? (ed.path.length > 8 ? '..' + ed.path.slice(-6) : ed.path) : '(new)';
+      if (ed.scroll !== null) {
+        const v = pagedRows(ed.text || '(empty)', ed.scroll, (p, n) => fit('rd ' + label + ' ' + p + '/' + n));
+        ed.scroll = v.page;
+        return v.rows;
+      }
+      return [fit('edit ' + label + (ed.dirty ? '*' : ''))].concat(tailRows(ed.text + '_', INPUT_ROWS));
     }
+
+    case 'files': {
+      const fm = os.files;
+      if (fm.newName !== null) return tailRows('new file: ' + fm.newName + '_', INPUT_ROWS);
+      if (fm.notice) return wrapWords(fm.notice);
+      const list = fmEntries(t);
+      if (!list.length) return ['(no files)'];
+      fm.cursor = Math.min(Math.max(fm.cursor, 0), list.length - 1);
+      const e = list[fm.cursor];
+      return layoutRows('▶ ' + e.name + (e.type === 'dir' ? '/' : '') + ' ' + (fm.cursor + 1) + '/' + list.length);
+    }
+
     case 'clok': {
       const d = new Date();
       if (os.clock.showDate) {
-        return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+        return [d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())];
       }
       let hours = d.getHours();
       if (!os.clock.use24h) hours = (hours % 12) || 12;
-      return pad2(hours) + ':' + pad2(d.getMinutes()) + (os.clock.use24h ? '' : (d.getHours() >= 12 ? ' PM' : ' AM'));
+      return [pad2(hours) + ':' + pad2(d.getMinutes()) + (os.clock.use24h ? '' : (d.getHours() >= 12 ? ' PM' : ' AM'))];
     }
+
     case 'dice':
-      return 'd' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result);
-    case 'ai':
-      if (os.ai.shown) return os.ai.text || os.screen;
-      return 'AI:' + (os.ai.draft || '_');
+      return ['d' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result)];
+
+    case 'ai': {
+      const ai = os.ai;
+      if (ai.notice) return wrapWords(ai.notice);
+      if (ai.shown) return wrapWords(ai.text).slice(0, 16);
+      return tailRows('AI:' + ai.draft + '_', INPUT_ROWS);
+    }
+
     default:
-      return 'err';
+      return ['err'];
   }
 }
 
-// Clear the panel, then write one line. Replaces whatever was still being drawn.
-function osDraw(t, line) {
-  const text = Array.from(String(line)).slice(0, CHARS_PER_ROW);
-  t.os.screen = text.join('');
-  t.queue = [];
-  t.queue.push(...clearFrames());
-  if (text.length) t.queue.push(...buildFrames(t, text.map(encode)));
+function redrawOS(t) {
+  osShow(t, osRows(t));
 }
 
-// Clear the panel, then write one multi-row block (used by the AI app).
-function osAiDraw(t, text) {
-  const chars = Array.from(String(text)).slice(0, CHARS_PER_ROW * 8);
-  t.os.screen = chars.slice(0, CHARS_PER_ROW).join('');
-  t.queue = [];
-  t.queue.push(...clearFrames());
-  if (chars.length) t.queue.push(...buildFrames(t, chars.map(encode)));
-}
-
-// I/O key: on = menu, off = blank screen (the OS forgets everything).
+// I/O key: on = menu, off = blank screen (typed text is forgotten, saved files are not).
 // Mutates t.os instead of replacing it, so the debounce map survives toggles.
 function osPower(t, on) {
   const os = t.os;
   if (!!os.power === !!on) return;   // already in that state
+  abandonChat(t);
   os.power = !!on;
   os.app = 'menu';
   os.cursor = 0;
   os.screen = '';
   os.lastKey = '';
-  os.term = { buf: '', out: null };
-  os.editor = { text: '' };
+  os.term = newTerm();
+  os.editor = newEditor();
+  os.files = newFiles();
   os.clock = { showDate: false, use24h: true };
   os.dice = { side: 1, result: null };
-  os.ai = { shown: false, text: '', draft: '' };
+  os.ai = newAi();
   if (on) {
     os.bootedAt = Date.now();
-    osDraw(t, osLine(t));
+    redrawOS(t);
     noteAction(t, 'OS on');
   } else {
     t.queue = [];
@@ -924,130 +1273,474 @@ function osPower(t, on) {
 
 // ---- terminal ----
 
-// Accept number words because the dedicated keyboard provides alphabet keys and space.
+// The keyboard has no digit keys, so numbers are typed as words.
 const NUMBER_WORDS = {
   zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
   eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
   sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
+  thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+  hundred: 100, thousand: 1000,
 };
 
 function parseTerminalNumber(value) {
   const raw = String(value ?? '').trim().toLowerCase();
   if (/^-?\d+(?:\.\d+)?$/.test(raw)) return Number(raw);
-  return Object.prototype.hasOwnProperty.call(NUMBER_WORDS, raw)
-    ? NUMBER_WORDS[raw]
-    : NaN;
+  return Object.prototype.hasOwnProperty.call(NUMBER_WORDS, raw) ? NUMBER_WORDS[raw] : NaN;
 }
 
+const USAGE = {
+  ls: 'ls [-l] [path]', cd: 'cd [path]', pwd: 'pwd', cat: 'cat file',
+  mkdir: 'mkdir dir', touch: 'touch file', rm: 'rm [-r] path',
+  cp: 'cp from to', mv: 'mv from to or rename',
+  write: 'write file text', append: 'append file text (new line)',
+  edit: 'edit [file]', wc: 'wc file', head: 'head file [n]', tail: 'tail file [n]',
+  find: 'find text', grep: 'grep text file', tree: 'tree [path]', df: 'df (space used)',
+  run: 'run file (one command per line)', history: 'history',
+  echo: 'echo text', time: 'time', date: 'date', ver: 'ver', about: 'about', sys: 'sys',
+  uptime: 'uptime', whoami: 'whoami', rand: 'rand [max]', roll: 'roll [sides]', flip: 'flip',
+  add: 'add a b', sub: 'sub a b', mul: 'mul a b', div: 'div a b', mod: 'mod a b', pow: 'pow a b',
+  upper: 'upper text', reverse: 'reverse text', len: 'len text',
+  clear: 'clear', exit: 'exit to menu', off: 'power off',
+};
+
+// One row each (16 columns). "help cmd" shows the usage of one command.
+const HELP_TEXT = [
+  'ls cd pwd cat', 'mkdir touch rm', 'cp mv write', 'append edit wc',
+  'head tail find', 'grep tree df', 'run history', 'echo time date',
+  'ver about sys', 'uptime whoami', 'rand roll flip', 'add sub mul div',
+  'mod pow upper', 'reverse len', 'clear exit off', 'help cmd = usage',
+].join('\n');
+
+const NO_SCRIPT = new Set(['run', 'edit', 'open', 'nano', 'exit', 'off', 'clear', 'cls']);
+
+// Run every non-empty line of a script file. Returns the combined output.
+function runScript(t, text) {
+  const outs = [];
+  for (const raw of String(text).split('\n').slice(0, 20)) {
+    const line = raw.trim().toLowerCase();
+    if (!line) continue;
+    const c = line.split(/\s+/)[0];
+    if (NO_SCRIPT.has(c)) { outs.push(c + ': not in script'); continue; }
+    const o = execLine(t, line);
+    if (o) outs.push(String(o));
+  }
+  return outs.join('\n') || 'ok';
+}
+
+// Execute one command line. Returns the output text, or null for "nothing to show".
+function execLine(t, line) {
+  const os = t.os;
+  const tm = os.term;
+  const root = fsRoot(t);
+  const [cmd, ...args] = line.split(/\s+/);
+  const d = new Date();
+  const abs = (p) => pathStr(splitPath(tm.cwd, p));
+  const usage = (name) => 'use: ' + USAGE[name];
+  const done = (err) => (err ? cmd + ': ' + err : 'ok');
+  const fileArg = (name) => {
+    if (!name) return { err: usage(cmd) };
+    const node = lookup(root, splitPath(tm.cwd, name));
+    if (!node) return { err: cmd + ': no such file' };
+    if (node.type !== 'file') return { err: cmd + ': is a dir' };
+    return { node };
+  };
+  const countArg = (v) => {
+    const n = v === undefined ? 4 : parseTerminalNumber(v);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4;
+  };
+
+  switch (cmd) {
+    // ---- help & info ----
+    case 'help': case 'commands': case '?':
+      if (args[0]) return USAGE[args[0]] ? args[0] + ': ' + USAGE[args[0]] : 'no help for ' + args[0];
+      return HELP_TEXT;
+    case 'echo':
+      return args.join(' ');
+    case 'time':
+      return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+    case 'date':
+      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    case 'ver': case 'version':
+      return 'bldos v' + OS_VERSION;
+    case 'about':
+      return 'panel os';
+    case 'hello':
+      return 'hello!';
+    case 'whoami':
+      return 'user';
+    case 'uptime':
+      return Math.max(0, Math.floor((Date.now() - os.bootedAt) / 1000)) + ' sec';
+    case 'sys': case 'neofetch': {
+      const st = fsStats(root);
+      const up = Math.max(0, Math.floor((Date.now() - os.bootedAt) / 1000));
+      return 'bldos v' + OS_VERSION + '\nup ' + up + ' sec\nfiles ' + st.nodes + '/' + FS_MAX_NODES + '\nchars ' + st.chars;
+    }
+    case 'history':
+      return tm.hist.slice(-8).join('\n') || '(none)';
+    case 'clear': case 'cls':
+      return '';
+    case 'exit':
+      os.app = 'menu';
+      return null;
+    case 'off':
+      osPower(t, false);
+      return null;
+
+    // ---- small utilities ----
+    case 'rand': {
+      const maxArg = args.length ? parseTerminalNumber(args[0]) : 100;
+      const max = Number.isFinite(maxArg) && maxArg > 0 ? Math.floor(maxArg) : 100;
+      return String(Math.floor(Math.random() * max));
+    }
+    case 'roll': {
+      const n = args.length ? parseTerminalNumber(args[0]) : 6;
+      const sides = Number.isFinite(n) && n >= 2 ? Math.floor(n) : 6;
+      return String(1 + Math.floor(Math.random() * sides));
+    }
+    case 'flip':
+      return Math.random() < 0.5 ? 'heads' : 'tails';
+    case 'add': case 'sub': case 'mul': case 'div': case 'mod': case 'pow': {
+      const a = parseTerminalNumber(args[0]);
+      const b = parseTerminalNumber(args[1]);
+      if (args.length < 2 || !Number.isFinite(a) || !Number.isFinite(b)) return 'use number words';
+      if ((cmd === 'div' || cmd === 'mod') && b === 0) return 'err: div by 0';
+      const r = cmd === 'add' ? a + b : cmd === 'sub' ? a - b : cmd === 'mul' ? a * b
+        : cmd === 'div' ? a / b : cmd === 'mod' ? a % b : Math.pow(a, b);
+      return Number.isFinite(r) ? String(Math.round(r * 1000) / 1000) : 'err: overflow';
+    }
+    case 'upper':
+      return args.join(' ').toUpperCase();
+    case 'reverse':
+      return Array.from(args.join(' ')).reverse().join('');
+    case 'len':
+      return String(args.join(' ').length);
+
+    // ---- filesystem ----
+    case 'pwd':
+      return tm.cwd;
+    case 'cd': {
+      const segs = splitPath(tm.cwd, args[0] || '/');
+      const n = lookup(root, segs);
+      if (!n) return 'cd: no such dir';
+      if (n.type !== 'dir') return 'cd: not a dir';
+      tm.cwd = pathStr(segs);
+      return null;
+    }
+    case 'ls': case 'dir': {
+      const long = args.includes('-l');
+      const segs = splitPath(tm.cwd, args.find((a) => !a.startsWith('-')) || '.');
+      const node = lookup(root, segs);
+      if (!node) return 'ls: no such path';
+      if (node.type === 'file') return segs[segs.length - 1] + (long ? ' ' + node.content.length : '');
+      const names = sortedNames(node);
+      if (!names.length) return '(empty)';
+      return names.map((n) => {
+        const c = node.children[n];
+        return n + (c.type === 'dir' ? '/' : (long ? ' ' + c.content.length : ''));
+      }).join('\n');
+    }
+    case 'tree': {
+      const segs = splitPath(tm.cwd, args[0] || '.');
+      const node = lookup(root, segs);
+      if (!node) return 'tree: no such path';
+      if (node.type === 'file') return segs[segs.length - 1];
+      const lines = [];
+      const walk = (dir, depth) => {
+        for (const name of sortedNames(dir)) {
+          if (lines.length >= 60) return;
+          const c = dir.children[name];
+          lines.push('  '.repeat(depth) + name + (c.type === 'dir' ? '/' : ''));
+          if (c.type === 'dir') walk(c, depth + 1);
+        }
+      };
+      walk(node, 0);
+      return lines.length ? lines.join('\n') : '(empty)';
+    }
+    case 'cat': {
+      const f = fileArg(args[0]);
+      return f.err || f.node.content || '(empty)';
+    }
+    case 'head': case 'tail': {
+      const f = fileArg(args[0]);
+      if (f.err) return f.err;
+      const n = countArg(args[1]);
+      const lines = f.node.content.split('\n');
+      return (cmd === 'head' ? lines.slice(0, n) : lines.slice(-n)).join('\n') || '(empty)';
+    }
+    case 'wc': {
+      const f = fileArg(args[0]);
+      if (f.err) return f.err;
+      const c = f.node.content;
+      return (c ? c.split('\n').length : 0) + ' lines\n' + c.split(/\s+/).filter(Boolean).length + ' words\n' + c.length + ' chars';
+    }
+    case 'grep': {
+      if (args.length < 2) return usage('grep');
+      const f = fileArg(args[1]);
+      if (f.err) return f.err;
+      const hits = f.node.content.split('\n').filter((l) => l.includes(args[0]));
+      return hits.length ? hits.join('\n') : '(none)';
+    }
+    case 'find': {
+      if (!args[0]) return usage('find');
+      const startSegs = splitPath(tm.cwd, '.');
+      const start = lookup(root, startSegs);
+      const hits = [];
+      const walk = (dir, segs) => {
+        for (const name of sortedNames(dir)) {
+          if (hits.length >= 40) return;
+          const p = segs.concat(name);
+          if (name.includes(args[0])) hits.push(pathStr(p));
+          if (dir.children[name].type === 'dir') walk(dir.children[name], p);
+        }
+      };
+      if (start && start.type === 'dir') walk(start, startSegs);
+      return hits.length ? hits.join('\n') : '(none)';
+    }
+    case 'df': {
+      const st = fsStats(root);
+      return 'files ' + st.nodes + '/' + FS_MAX_NODES + '\nchars ' + st.chars + '/' + FS_MAX_TOTAL_CHARS;
+    }
+    case 'mkdir': case 'touch': {
+      if (!args.length) return usage(cmd);
+      for (const a of args) {
+        let err;
+        if (cmd === 'mkdir') {
+          err = fsMkdir(t, abs(a));
+        } else {
+          const ex = lookup(root, splitPath(tm.cwd, a));
+          if (ex) { ex.mtime = Date.now(); scheduleSave(); err = null; }
+          else err = fsWriteFile(t, abs(a), '');
+        }
+        if (err) return cmd + ': ' + err;
+      }
+      return 'ok';
+    }
+    case 'rm': {
+      const recursive = args.includes('-r') || args.includes('-rf');
+      const targets = args.filter((a) => !a.startsWith('-'));
+      if (!targets.length) return usage('rm');
+      for (const a of targets) {
+        const err = fsRemove(t, abs(a), recursive);
+        if (err) return 'rm: ' + err;
+      }
+      return 'ok';
+    }
+    case 'cp': case 'mv':
+      if (args.length < 2) return usage(cmd);
+      return done(cmd === 'cp' ? fsCopy(t, abs(args[0]), abs(args[1])) : fsMove(t, abs(args[0]), abs(args[1])));
+    case 'write': case 'append': {
+      if (args.length < (cmd === 'append' ? 2 : 1)) return usage(cmd);
+      const text = args.slice(1).join(' ');
+      const p = abs(args[0]);
+      let content = text;
+      if (cmd === 'append') {
+        const ex = lookup(root, splitPath('/', p));
+        if (ex && ex.type === 'file' && ex.content) content = ex.content + '\n' + text;
+      }
+      return done(fsWriteFile(t, p, content));
+    }
+    case 'edit': case 'open': case 'nano': {
+      if (!args[0]) {
+        os.editor = newEditor();
+        os.editor.returnTo = 'term';
+        os.app = 'edit';
+        return null;
+      }
+      const err = openEditor(t, abs(args[0]), 'term');
+      return err ? 'edit: ' + err : null;
+    }
+    case 'run': {
+      const f = fileArg(args[0]);
+      return f.err || runScript(t, f.node.content);
+    }
+
+    default:
+      return 'err: ' + cmd;
+  }
+}
+
+// ENTER in the terminal.
 function runCommand(t) {
   const tm = t.os.term;
   const line = tm.buf.trim().toLowerCase();
   tm.buf = '';
   tm.out = null;
+  tm.page = 0;
+  tm.histIdx = -1;
   if (!line) return;
+  tm.hist.push(line);
+  if (tm.hist.length > HIST_MAX) tm.hist.shift();
+  if (!lookup(fsRoot(t), splitPath('/', tm.cwd))) tm.cwd = '/';   // the folder was removed
+  const out = execLine(t, line);
+  tm.out = out === undefined || out === null ? null : String(out);
+}
 
-  const [cmd, ...args] = line.split(/\s+/);
-  const d = new Date();
-  switch (cmd) {
-    case 'help':
-    case 'commands':
-      // Kept short enough to fit on one 16-character panel row.
-      tm.out = 'echo time date';
-      break;
-    case 'echo':
-      tm.out = args.join(' ') || ' '; 
-      break;
-    case 'time':
-      tm.out = pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
-      break;
-    case 'date':
-      tm.out = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
-      break;
-    case 'ver':
-    case 'version':
-      tm.out = 'bldos v' + OS_VERSION;
-      break;
-    case 'about':
-      tm.out = 'panel os';
-      break;
-    case 'hello':
-      tm.out = 'hello!';
-      break;
-    case 'rand': {
-      const maxArg = args.length ? parseTerminalNumber(args[0]) : 100;
-      const max = Number.isFinite(maxArg) && maxArg > 0 ? Math.floor(maxArg) : 100;
-      tm.out = String(Math.floor(Math.random() * max));
-      break;
-    }
-    case 'add': case 'sub': case 'mul': case 'div': {
-      const a = parseTerminalNumber(args[0]);
-      const b = parseTerminalNumber(args[1]);
-      if (args.length < 2 || !Number.isFinite(a) || !Number.isFinite(b)) {
-        tm.out = 'use number words';
-        break;
-      }
-      if (cmd === 'div' && b === 0) {
-        tm.out = 'err: div by 0';
-        break;
-      }
-      const result = cmd === 'add' ? a + b
-        : cmd === 'sub' ? a - b
-        : cmd === 'mul' ? a * b
-        : a / b;
-      tm.out = String(Math.round(result * 1000) / 1000);
-      break;
-    }
-    case 'uptime': {
-      const seconds = Math.max(0, Math.floor((Date.now() - t.os.bootedAt) / 1000));
-      tm.out = seconds + ' sec';
-      break;
-    }
-    case 'clear':
-    case 'cls':
-      tm.out = '';
-      break;
-    case 'exit':
-      t.os.app = 'menu';
-      break;
-    case 'off':
-      osPower(t, false);
-      break;
-    default:
-      tm.out = 'err: ' + cmd;
+function termHistory(tm, key) {
+  if (!tm.hist.length) return;
+  if (key === 'up') {
+    tm.histIdx = tm.histIdx < 0 ? tm.hist.length - 1 : Math.max(0, tm.histIdx - 1);
+  } else {
+    if (tm.histIdx < 0) return;
+    tm.histIdx++;
+    if (tm.histIdx >= tm.hist.length) { tm.histIdx = -1; tm.buf = ''; return; }
   }
+  tm.buf = tm.hist[tm.histIdx];
 }
 
 function termKey(t, key) {
-  const tm = t.os.term;
+  const os = t.os;
+  const tm = os.term;
+  if (key === 'select') { os.app = 'menu'; return; }
   if (tm.out !== null) {
-    tm.out = null;
+    if (key === 'up' || key === 'down') {                    // page through long output
+      const pages = pagedRows(tm.out, 0).pages;
+      tm.page = Math.min(Math.max(tm.page + (key === 'down' ? 1 : -1), 0), pages - 1);
+      return;
+    }
+    tm.out = null;                                           // any other key leaves the output
     tm.buf = '';
+    tm.page = 0;
   }
+  if (key === 'fn1') tm.buf = '';
+  else if (key === 'fn2') tm.buf = tm.buf.slice(0, -1);
+  else if (key === 'up' || key === 'down') termHistory(tm, key);
+}
+
+// ---- text editor ----
+
+// Open a file (or a new file name) in the editor. Returns an error string or null.
+function openEditor(t, p, returnTo) {
+  const os = t.os;
+  const segs = splitPath('/', p);
+  const node = lookup(fsRoot(t), segs);
+  if (node && node.type === 'dir') return 'is a dir';
+  if (!node) {
+    const s = fsSplit(t, pathStr(segs));
+    if (s.err) return s.err;
+  }
+  os.editor = Object.assign(newEditor(), { path: pathStr(segs), text: node ? node.content : '', returnTo });
+  os.app = 'edit';
+  return null;
+}
+
+function leaveEditor(t) {
+  const to = t.os.editor.returnTo;
+  t.os.app = to === 'term' || to === 'files' ? to : 'menu';
+}
+
+function editorSave(t) {
+  const ed = t.os.editor;
+  if (!ed.path) { ed.saveAs = ''; return; }          // unnamed document: ask for a name
+  const err = fsWriteFile(t, ed.path, ed.text);
+  if (err) ed.notice = 'save failed: ' + err;
+  else { ed.dirty = false; ed.notice = 'saved'; }
+}
+
+// ENTER while the "save as" name is being typed.
+function editorConfirmName(t) {
+  const ed = t.os.editor;
+  const segs = splitPath('/', String(ed.saveAs).trim());
+  const target = pathStr(segs);
+  ed.saveAs = null;
+  const err = fsWriteFile(t, target, ed.text);
+  if (err) { ed.notice = 'save failed: ' + err; return; }
+  ed.path = target;
+  ed.dirty = false;
+  ed.notice = 'saved ' + target;
+}
+
+function editorKey(t, key) {
+  const ed = t.os.editor;
+  if (ed.saveAs !== null) {                           // typing a file name
+    if (key === 'select') ed.saveAs = null;
+    else if (key === 'fn1') ed.saveAs = '';
+    else if (key === 'fn2') ed.saveAs = ed.saveAs.slice(0, -1);
+    return;
+  }
+  ed.notice = '';
   if (key === 'fn1') {
-    if (tm.buf.length < TERM_MAX) tm.buf += ' ';
+    editorSave(t);
   } else if (key === 'fn2') {
-    tm.buf = '';
-  } else if (key === 'select') {
-    t.os.app = 'menu';
+    ed.scroll = null;
+    if (ed.text.length) { ed.text = ed.text.slice(0, -1); ed.dirty = true; }
+  } else if (key === 'up') {
+    ed.scroll = ed.scroll === null ? 0 : ed.scroll - 1;
   } else if (key === 'down') {
-    runCommand(t);
+    ed.scroll = ed.scroll === null ? 0 : ed.scroll + 1;
+  } else if (key === 'select') {
+    if (ed.dirty && !(ed.path === null && !ed.text)) {
+      if (!ed.path) { ed.saveAs = ''; return; }       // unnamed: ask for a name first
+      const err = fsWriteFile(t, ed.path, ed.text);
+      if (err) { ed.notice = 'save failed: ' + err; return; }
+      ed.dirty = false;
+    }
+    leaveEditor(t);
   }
 }
 
-// Dedicated alphabet keys type directly into the editor. FN1 adds a space, FN2 deletes.
-function editorKey(t, key) {
-  const ed = t.os.editor;
-  if (key === 'fn1') {
-    if (ed.text.length < EDITOR_MAX) ed.text += ' ';
-  } else if (key === 'fn2') {
-    ed.text = ed.text.slice(0, -1);
-  } else if (key === 'select') {
-    t.os.app = 'menu';
-  } else if (key === 'down') {
-    t.os.app = 'menu';
-  }
+// ---- file manager ----
+
+function fmGoUp(fm) {
+  const segs = splitPath('/', fm.cwd);
+  segs.pop();
+  fm.cwd = pathStr(segs);
+  fm.cursor = 0;
 }
+
+function fmOpen(t) {
+  const fm = t.os.files;
+  const list = fmEntries(t);
+  const e = list[Math.min(fm.cursor, list.length - 1)];
+  if (!e) return;
+  if (e.up) return fmGoUp(fm);
+  const target = pathStr(splitPath(fm.cwd, e.name));
+  if (e.type === 'dir') { fm.cwd = target; fm.cursor = 0; return; }
+  const err = openEditor(t, target, 'files');
+  if (err) fm.notice = 'open failed: ' + err;
+}
+
+// ENTER while the new file name is being typed.
+function fmCreate(t) {
+  const fm = t.os.files;
+  const name = fm.newName.trim();
+  fm.newName = null;
+  if (!validName(name)) { fm.notice = 'bad name'; return; }
+  const err = openEditor(t, pathStr(splitPath(fm.cwd, name)), 'files');   // saved on first save
+  if (err) fm.notice = 'open failed: ' + err;
+}
+
+function filesKey(t, key) {
+  const os = t.os;
+  const fm = os.files;
+  if (fm.newName !== null) {                          // typing a new file name
+    if (key === 'select') fm.newName = null;
+    else if (key === 'fn1') fm.newName = '';
+    else if (key === 'fn2') fm.newName = fm.newName.slice(0, -1);
+    return;
+  }
+  fm.notice = '';
+  const list = fmEntries(t);
+  if (key === 'down') fm.cursor = list.length ? (fm.cursor + 1) % list.length : 0;
+  else if (key === 'up') fm.cursor = list.length ? (fm.cursor - 1 + list.length) % list.length : 0;
+  else if (key === 'select') fmOpen(t);
+  else if (key === 'fn1') { if (fm.cwd === '/') os.app = 'menu'; else fmGoUp(fm); }
+  else if (key === 'fn2') fm.newName = '';
+}
+
+// ---- ai chat ----
+
+function aiKey(t, key) {
+  const ai = t.os.ai;
+  if (key === 'select') { abandonChat(t); ai.notice = ''; t.os.app = 'menu'; return; }
+  if (t.chatBusy) return;
+  if (ai.shown) { ai.shown = false; ai.text = ''; ai.draft = ''; }
+  ai.notice = '';
+  if (key === 'fn1') ai.draft = '';
+  else if (key === 'fn2') ai.draft = ai.draft.slice(0, -1);
+}
+
+// ---- menu and other apps ----
 
 function menuKey(t, key) {
   const os = t.os;
@@ -1055,10 +1748,12 @@ function menuKey(t, key) {
   else if (key === 'up' || key === 'fn1') os.cursor = (os.cursor - 1 + APPS.length) % APPS.length;
   else if (key === 'select') {
     os.app = APPS[os.cursor].id;
-    if (os.app === 'term') os.term = { buf: '', out: null };
+    if (os.app === 'term') { os.term.buf = ''; os.term.out = null; os.term.page = 0; os.term.histIdx = -1; }
+    if (os.app === 'edit') os.editor = newEditor();
+    if (os.app === 'files') { os.files.newName = null; os.files.notice = ''; }
     if (os.app === 'dice') os.dice.result = rollDie(os);
     if (os.app === 'ai') {
-      os.ai = { shown: false, text: '', draft: '' };
+      os.ai = newAi();
       clearHistory(t);
     }
   }
@@ -1066,33 +1761,19 @@ function menuKey(t, key) {
 
 function appKey(t, key) {
   const os = t.os;
-  if (key === 'select') {
-    if (os.app === 'ai') abandonChat(t);
-    os.app = 'menu';
-    return;
-  }
-
   switch (os.app) {
-    case 'ai':
-      if (os.ai.shown) {
-        os.ai.shown = false;
-        os.ai.text = '';
-      }
-      if (key === 'fn1' && os.ai.draft.length < AI_DRAFT_MAX) os.ai.draft += ' ';
-      else if (key === 'fn2') os.ai.draft = os.ai.draft.slice(0, -1);
-      break;
-    case 'term':
-      termKey(t, key);
-      break;
-    case 'edit':
-      editorKey(t, key);
-      break;
+    case 'ai': aiKey(t, key); break;
+    case 'term': termKey(t, key); break;
+    case 'edit': editorKey(t, key); break;
+    case 'files': filesKey(t, key); break;
     case 'clok':
-      if (key === 'fn1') os.clock.showDate = !os.clock.showDate;
+      if (key === 'select') os.app = 'menu';
+      else if (key === 'fn1') os.clock.showDate = !os.clock.showDate;
       else if (key === 'fn2') os.clock.use24h = !os.clock.use24h;
       break;
     case 'dice':
-      if (key === 'fn1') os.dice.result = rollDie(os);
+      if (key === 'select') os.app = 'menu';
+      else if (key === 'fn1') os.dice.result = rollDie(os);
       else if (key === 'fn2' || key === 'down') {
         os.dice.side = (os.dice.side + 1) % DICE_SIDES.length;
         os.dice.result = null;
@@ -1101,13 +1782,9 @@ function appKey(t, key) {
         os.dice.result = null;
       }
       break;
+    default:
+      os.app = 'menu';
   }
-}
-
-// Redraw the current app, using the full panel for an AI answer.
-function redrawOS(t) {
-  if (t.os.app === 'ai' && t.os.ai.shown) osAiDraw(t, t.os.ai.text || osLine(t));
-  else osDraw(t, osLine(t));
 }
 
 // One control press from the main transmitter or the web page.
@@ -1153,29 +1830,86 @@ function osPins(t, bits) {
   return false;
 }
 
-// A letter key is sent to whichever text-capable application is currently open.
-function keyboardLetter(t, letter) {
+// ---- keyboard (letters, space, . - /, backspace, enter) ----
+
+// Put one character into whichever app is open. Returns false if the app takes no text.
+function textInput(t, ch) {
+  const os = t.os;
+  if (os.app === 'term') {
+    const tm = os.term;
+    if (tm.out !== null) { tm.out = null; tm.buf = ''; tm.page = 0; }
+    tm.histIdx = -1;
+    if (tm.buf.length < TERM_MAX) tm.buf += ch;
+    return true;
+  }
+  if (os.app === 'edit') {
+    const ed = os.editor;
+    if (ed.saveAs !== null) {
+      if (ch !== ' ' && ed.saveAs.length < 40) ed.saveAs += ch;
+      return true;
+    }
+    ed.notice = '';
+    ed.scroll = null;
+    if (ed.text.length < EDITOR_MAX) { ed.text += ch; ed.dirty = true; }
+    return true;
+  }
+  if (os.app === 'ai') {
+    const ai = os.ai;
+    if (t.chatBusy) return false;                     // wait for the answer
+    if (ai.shown) { ai.shown = false; ai.text = ''; ai.draft = ''; }
+    ai.notice = '';
+    if (ai.draft.length < AI_DRAFT_MAX) ai.draft += ch;
+    return true;
+  }
+  if (os.app === 'files') {
+    const fm = os.files;
+    if (fm.newName !== null) {
+      if (/^[a-z0-9._-]$/.test(ch) && fm.newName.length < 24) fm.newName += ch;
+      return true;
+    }
+    fm.notice = '';
+    const list = fmEntries(t);                        // jump to the next name starting with ch
+    for (let i = 1; i <= list.length; i++) {
+      const idx = (fm.cursor + i) % list.length;
+      if (list[idx].name.startsWith(ch)) { fm.cursor = idx; break; }
+    }
+    return true;
+  }
+  return false;
+}
+
+function keyboardChar(t, ch) {
+  const label = ch === ' ' ? 'space' : ch;
   if (!t.os.power || t.mode !== 'os') {
-    noteAction(t, 'keyboard ' + letter + ' ignored (OS off or not in OS mode)');
+    noteAction(t, 'keyboard ' + label + ' ignored (OS off or not in OS mode)');
+    return false;
+  }
+  if (!textInput(t, ch)) {
+    noteAction(t, 'keyboard ' + label + ' ignored (' + (t.chatBusy ? 'ai is thinking' : 'open terminal, text edit, files or ai chat') + ')');
+    return false;
+  }
+  t.os.lastKey = label;
+  t.lastKeyboardKey = label;
+  redrawOS(t);
+  noteAction(t, 'keyboard key ' + label + ' (' + t.os.app + ')');
+  return true;
+}
+
+function keyboardBackspace(t) {
+  if (!t.os.power || t.mode !== 'os') {
+    noteAction(t, 'keyboard BACKSPACE ignored (OS off or not in OS mode)');
     return false;
   }
   const os = t.os;
-  if (os.app === 'term') {
-    if (os.term.out !== null) { os.term.out = null; os.term.buf = ''; }
-    if (os.term.buf.length < TERM_MAX) os.term.buf += letter;
-  } else if (os.app === 'edit') {
-    if (os.editor.text.length < EDITOR_MAX) os.editor.text += letter;
-  } else if (os.app === 'ai') {
-    if (os.ai.shown) { os.ai.shown = false; os.ai.text = ''; os.ai.draft = ''; }
-    if (os.ai.draft.length < AI_DRAFT_MAX) os.ai.draft += letter;
-  } else {
-    noteAction(t, 'keyboard ' + letter + ' ignored (open terminal, text edit, or ai chat)');
-    return false;
-  }
-  os.lastKey = letter;
+  const ok = ['term', 'edit', 'ai', 'files'].includes(os.app)
+    && !(os.app === 'ai' && t.chatBusy)
+    && !(os.app === 'files' && os.files.newName === null);
+  if (!ok) { noteAction(t, 'keyboard BACKSPACE ignored (' + os.app + ')'); return false; }
+  appKey(t, 'fn2');                                   // FN2 is backspace in every text app
+  os.lastKey = 'backspace';
+  t.lastKeyboardKey = 'BACKSPACE';
   redrawOS(t);
-  noteAction(t, 'keyboard key ' + letter + ' (' + os.app + ')');
-  t.lastKeyboardKey = letter;
+  noteAction(t, 'keyboard BACKSPACE (' + os.app + ')');
   return true;
 }
 
@@ -1195,40 +1929,56 @@ function keyboardEnter(t) {
     noteAction(t, 'keyboard ENTER ran terminal command');
     return true;
   }
+
   if (os.app === 'edit') {
-    // Finish/save the current text; it remains in memory until the OS is powered off.
-    os.app = 'menu';
+    const ed = os.editor;
+    if (ed.saveAs !== null) {
+      editorConfirmName(t);
+    } else {
+      ed.notice = '';
+      ed.scroll = null;
+      if (ed.text.length < EDITOR_MAX) { ed.text += '\n'; ed.dirty = true; }
+    }
     redrawOS(t);
-    noteAction(t, 'keyboard ENTER saved text editor and returned to menu');
+    noteAction(t, 'keyboard ENTER (text edit)');
     return true;
   }
+
+  if (os.app === 'files') {
+    if (os.files.newName !== null) fmCreate(t);
+    else { os.files.notice = ''; fmOpen(t); }
+    redrawOS(t);
+    noteAction(t, 'keyboard ENTER (files)');
+    return true;
+  }
+
   if (os.app === 'ai') {
-    const message = os.ai.draft.trim();
-    if (!message) { noteAction(t, 'AI ENTER ignored (empty message)'); return false; }
-    if (!groqKey) { noteAction(t, 'AI ENTER ignored (no Groq key)'); return false; }
+    const ai = os.ai;
     if (t.chatBusy) { noteAction(t, 'AI ENTER ignored (still working)'); return false; }
-    os.ai.draft = '';
-    os.ai.shown = false;
-    os.ai.text = '';
-    osDraw(t, 'thinking...');
-    runOsChat(t, message).catch((e) => {
-      os.ai.draft = message;
-      os.ai.shown = false;
-      os.ai.text = '';
+    const message = normalizeText(ai.draft).trim().slice(0, MAX_INPUT_CHARS);
+    if (!message) { noteAction(t, 'AI ENTER ignored (empty message)'); return false; }
+    if (!groqKey) {
+      ai.notice = 'no groq key: save one on the web page';
       redrawOS(t);
-      noteAction(t, 'AI keyboard send failed: ' + e.message);
-    });
+      noteAction(t, 'AI ENTER ignored (no Groq key)');
+      return false;
+    }
+    runOsChat(t, message).catch((e) => noteAction(t, 'AI chat crashed: ' + e.message));
     noteAction(t, 'keyboard ENTER sent AI message');
     return true;
   }
+
   noteAction(t, 'keyboard ENTER ignored (no text input in ' + os.app + ')');
   return false;
 }
 
 function dispatchKeyboardKey(t, key) {
   if (key === 'enter') return keyboardEnter(t);
-  return keyboardLetter(t, key);
+  if (key === 'backspace') return keyboardBackspace(t);
+  return keyboardChar(t, Object.prototype.hasOwnProperty.call(KEY_CHARS, key) ? KEY_CHARS[key] : key);
 }
+
+loadStore();
 
 // Optional individual endpoints accept JSON booleans, 1/0, or true/false text.
 function toPressedBoolean(value) {
@@ -1265,7 +2015,6 @@ function inputPanel(req, res) {
   const password = givenPassword(req);
   if (!password) {
     // Keep the HTTP Transmitter response contract valid even on an auth error.
-    // Build Logic expects a string in response.value and reverses that string.
     res.status(403).json({ value: '00000000', error: 'Send the same pass header as the display transmitter.' });
     return null;
   }
@@ -1277,9 +2026,8 @@ function inputPanel(req, res) {
 }
 
 // KEYBOARD INPUT ROUTES
-// Accept POST (recommended) and GET (compatibility) so a transmitter configured
-// with either method does not fail with "Cannot GET/POST". They return the
-// required idle placeholder value=00000000; only /out supplies real display frames.
+// Accept POST (recommended) and GET (compatibility). They return the idle placeholder
+// value=00000000; only /out supplies real display frames.
 function handleKeyboardEndpoint(req, res, routeName) {
   const t = inputPanel(req, res);
   if (!t) return;
@@ -1301,12 +2049,8 @@ function handleKeyboardEndpoint(req, res, routeName) {
     };
     console.log('[keyboard ' + bank.id + '] ' + JSON.stringify(t.lastKeyboardRequest));
 
-    // Return HTTP 200 (not 204) for broad compatibility with game transmitters.
-    // Invalid/missing input is reported in JSON and Render logs instead of a bare HTTP 400.
     if (bits === null) {
       noteAction(t, 'keyboard bank ' + bank.id + ' received unrecognized input format');
-      // The keyboard device only sends input. Return a valid idle output frame
-      // because Build Logic's HTTP Transmitter still expects response.value.
       return res.status(200).json({ value: '00000000' });
     }
 
@@ -1322,13 +2066,11 @@ function handleKeyboardEndpoint(req, res, routeName) {
     } else if (rising.length === 1) {
       dispatchKeyboardKey(t, rising[0]);
     }
-    // Required response shape for Build Logic: value must always be a string.
-    // This is only an idle placeholder; real display frames are returned by /out.
     return res.status(200).json({ value: '00000000' });
   }
 
-  // Also support /keys/a, /keys/b, ... /keys/z, /keys/enter as aliases.
-  if (/^(?:[a-z]|enter)$/.test(name)) {
+  // Also support /keys/a ... /keys/z, /keys/enter, /keys/space, /keys/backspace, /keys/dot ...
+  if (/^(?:[a-z]|enter|space|backspace|dot|dash|slash)$/.test(name)) {
     const pressed = readPressed(req);
     if (pressed === null) {
       return res.status(400).json({
@@ -1339,24 +2081,21 @@ function handleKeyboardEndpoint(req, res, routeName) {
     const prev = t.directKeyPrev.get(name) || false;
     t.directKeyPrev.set(name, pressed);
     if (pressed && !prev) dispatchKeyboardKey(t, name);
-    // Do not return 204: the game transmitter expects JSON containing a string value.
     return res.status(200).json({ value: '00000000' });
   }
 
   return res.status(404).json({
     value: '00000000',
-    error: 'Unknown keyboard endpoint. Use /keys/1 through /keys/4, or /key/a through /key/z and /key/enter.'
+    error: 'Unknown keyboard endpoint. Use /keys/1 through /keys/4, or /key/a through /key/z, /key/enter, /key/space, /key/backspace.'
   });
 }
 
 // Four 8-pin banks: /keys/1 ... /keys/4 (POST preferred; GET also accepted).
-// Alias paths /keyboard/1 ... /keyboard/4 are supported too.
 app.all(['/keys/:name', '/keyboard/:name'], (req, res) => {
   handleKeyboardEndpoint(req, res, req.params.name);
 });
 
-// Individual input endpoints, with two naming styles:
-// /key/a ... /key/z, /key/enter and /letter/a ... /letter/z, /letter/enter.
+// Individual input endpoints: /key/a ... /key/z, /key/enter and /letter/a ... /letter/enter.
 app.all(['/key/:key', '/letter/:key'], (req, res) => {
   handleKeyboardEndpoint(req, res, req.params.key);
 });
@@ -1442,12 +2181,8 @@ app.post('/api/chat', async (req, res) => {
     const message = normalizeText(req.body.message || '').trim().slice(0, MAX_INPUT_CHARS);
     if (!message) return res.status(400).json({ error: 'Type a message first.' });
 
-    let result;
-    try {
-      result = await runOsChat(t, message);
-    } catch (e) {
-      return res.status(502).json({ error: e.message });
-    }
+    const result = await runOsChat(t, message);
+    if (result.error) return res.status(502).json({ error: result.error });
     if (result.interrupted) {
       return res.json({ reply: '(interrupted)', interrupted: true, queued: t.queue.length, memory: t.history.length / 2 });
     }
@@ -1504,7 +2239,7 @@ app.post('/api/os/mode', (req, res) => {
   t.mode = mode;
   t.prevIn = null;   // fresh edge detection for the new mode
   t.queue = [];
-  if (mode === 'os' && t.os.power) osDraw(t, osLine(t));
+  if (mode === 'os' && t.os.power) redrawOS(t);
   else t.queue.push(...clearFrames());
   noteAction(t, 'mode: ' + mode);
   res.json({ ok: true, mode });
@@ -1514,9 +2249,9 @@ app.post('/api/os/mode', (req, res) => {
 app.post('/api/os/key', (req, res) => {
   const t = req.transmitter;
   const key = String(req.body.key || '');
-  if (!OS_PINS.includes(key) && key !== 'enter') return res.status(400).json({ error: 'Unknown key.' });
+  if (!OS_PINS.includes(key) && !WEB_KEYBOARD_KEYS.has(key)) return res.status(400).json({ error: 'Unknown key.' });
   if (t.mode !== 'os') return res.status(409).json({ error: 'Switch this transmitter to OS mode first.' });
-  if (key === 'enter') keyboardEnter(t);
+  if (WEB_KEYBOARD_KEYS.has(key)) dispatchKeyboardKey(t, key);
   else osKey(t, key);
   res.json({ ok: true, power: t.os.power, screen: t.os.screen });
 });
@@ -1583,10 +2318,12 @@ app.post('/api/cancel', (req, res) => {
 
 app.get('/api/status', (req, res) => {
   const t = req.transmitter;
+  const fsInfo = fsStats(fsRoot(t));
   res.json({
     key: !!groqKey,
     mode: t.mode,
     os: { power: t.os.power, app: t.os.app, screen: t.os.screen, lastKey: t.os.lastKey, aiShown: t.os.ai.shown },
+    fs: { nodes: fsInfo.nodes, chars: fsInfo.chars, file: DATA_FILE },
     model: GROQ_MODEL,
     prompt: t.customPrompt !== null ? 'custom' : 'default',
     memory: t.history.length / 2,
@@ -1643,7 +2380,7 @@ const PAGE = `<!doctype html>
   code { background:#333; padding:0 .25rem; border-radius:4px; }
   details { background:#1c1c1c; border-radius:12px; padding:1rem; }
   summary { cursor:pointer; font-weight:600; }
-  pre.screen { background:#000; color:#7f7; font-family:monospace; font-size:1.5rem; line-height:1.3; letter-spacing:.2em; white-space:pre; padding:.6rem .8rem; border-radius:8px; margin:.4rem .2rem; min-height:3.6rem; }
+  pre.screen { background:#000; color:#7f7; font-family:monospace; font-size:1.2rem; line-height:1.3; letter-spacing:.15em; white-space:pre; padding:.6rem .8rem; border-radius:8px; margin:.4rem .2rem; min-height:3.6rem; overflow-x:auto; }
   .keys button { min-width:5.2rem; }
 </style>
 <h1>Panel Text</h1>
@@ -1656,7 +2393,7 @@ const PAGE = `<!doctype html>
   <button id="connectbtn" onclick="connect()">Connect</button>
   <button class="gray" onclick="genPass()">Generate</button>
   <button class="gray" onclick="disconnect()">Disconnect</button>
-  <small>Type the same password you put in your in-game HTTP Transmitter. A new password creates a new transmitter (a separate panel); typing an existing one goes back to it. Each password has its own queue, conversation, prompt and OS, so you can drive several panels from this server. Each browser tab remembers its own password, so open a second tab for a second panel.</small>
+  <small>Type the same password you put in your in-game HTTP Transmitter. A new password creates a new transmitter (a separate panel) with its own saved files; typing an existing one goes back to it. Each password has its own queue, conversation, prompt, OS and filesystem. Each browser tab remembers its own password, so open a second tab for a second panel.</small>
   <div class="st">Headers dictionary for the game's HTTP Transmitter:</div>
   <textarea id="dict" class="dict" readonly spellcheck="false" placeholder='{"pass":"your-password"}'></textarea>
   <button class="gray" onclick="copyDict()">Copy dictionary</button>
@@ -1668,7 +2405,7 @@ const PAGE = `<!doctype html>
   <input id="key" type="password" placeholder="gsk_..." autocomplete="off">
   <button onclick="saveKey()">Save key</button>
   <button class="gray" onclick="forgetKey()">Forget key</button>
-  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. Needed by AI mode and by the OS "ai chat" app. The rest of the simulated OS does not need it.</small>
+  <small>Get one at console.groq.com/keys. It is kept in the server's memory only (lost on restart), and is shared by every transmitter on this server. Needed by AI mode and by the OS "ai chat" app. The rest of the simulated OS does not need it. You can also start the server with GROQ_API_KEY=gsk_... so the key is loaded automatically.</small>
   <div class="st" id="keyst">not connected</div>
 </section>
 
@@ -1678,14 +2415,14 @@ const PAGE = `<!doctype html>
   <button id="sendbtn" class="needs-key" onclick="sendMsg()">Send</button>
   <button class="gray" onclick="clearMemory()">New conversation</button>
   <small><b>AI mode:</b> the panel shows your message first, then the reply.<br>
-  <b>OS mode:</b> open the <b>ai chat</b> app on the panel first (menu → ai chat → select), then send from here.</small>
+  <b>OS mode:</b> open the <b>ai chat</b> app on the panel first (menu → ai chat → select), then send from here, or just type on the keyboard and press ENTER.</small>
   <div class="st" id="reply"></div>
 </section>
 
 <section id="promptsec" class="locked">
   <h2>4. AI prompt (for this transmitter)</h2>
   <textarea id="prompt" placeholder="Describe how the AI should behave..."></textarea>
-  <label class="wrap"><input id="rules" type="checkbox" checked>Add the panel rules (one short line, only characters the panel can draw)</label>
+  <label class="wrap"><input id="rules" type="checkbox" checked>Add the panel rules (short answers, only characters the panel can draw)</label>
   <button onclick="savePrompt()">Save prompt</button>
   <button class="gray" onclick="resetPrompt()">Reset to default</button>
   <small>Example: You are a grumpy pirate. Answer in pirate slang. Saving starts a new conversation on this transmitter. Leave the box empty and save to go back to the default. Kept in memory only.</small>
@@ -1704,12 +2441,22 @@ const PAGE = `<!doctype html>
     <button onclick="osKey('up')">Up (3)</button><br>
     <button onclick="osKey('select')">Select (4)</button>
     <button onclick="osKey('fn1')">FN1 (5)</button>
-    <button onclick="osKey('fn2')">FN2 (6)</button>
+    <button onclick="osKey('fn2')">FN2 (6)</button><br>
     <button onclick="osKey('enter')">Keyboard Enter</button>
+    <button onclick="osKey('space')">Keyboard Space</button>
+    <button onclick="osKey('backspace')">Backspace</button>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
-  <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER on pins 1-3. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z and /key/enter, with {&quot;pressed&quot;:true/false} or an 8-bit pin value; those need 27 input transmitters if configured one device per key (28 total including display). Recommended bank setup is 5 total. Only /out returns panel frames. Menu: UP/FN1 previous app, DOWN/FN2 next app, SELECT opens. Terminal: keyboard letters type; FN1=space, FN2=clear line, ENTER runs command; DOWN also runs; SELECT exits. Commands: help, echo, time, date, ver, about, hello, rand, add, sub, mul, div, uptime, clear, exit, off. For math and rand limits, spell numbers (example: add five three). Text editor: keyboard letters type; FN1=space, FN2=backspace, ENTER saves and returns to menu; SELECT exits. AI chat: keyboard letters type; FN1=space, FN2=backspace, ENTER sends to Groq; SELECT exits. Clock: FN1 toggles time/date, FN2 toggles 12/24-hour format. Dice: FN1 rolls, FN2 cycles dice type; UP/DOWN also change dice type.</small>
+  <div class="st" id="osfs"></div>
+  <small>Keyboard pins (leftmost bit = pin 1): /keys/1 = A-H, /keys/2 = I-P, /keys/3 = Q-X, /keys/4 = Y, Z, ENTER, SPACE, BACKSPACE, dot, dash, slash on pins 1-8. Example POST body: {&quot;value&quot;:&quot;10000000&quot;}; POST all-zero bits on release. Use the same pass header as the default transmitter. Optional individual POST paths: /key/a ... /key/z, /key/enter, /key/space, /key/backspace, /key/dot, /key/dash, /key/slash with {&quot;pressed&quot;:true/false}. Only /out returns panel frames.<br><br>
+  <b>Menu:</b> UP/FN1 previous app, DOWN/FN2 next app, SELECT opens.<br>
+  <b>AI chat:</b> type with the keyboard (SPACE for spaces), ENTER sends to Groq, FN1 clears, FN2/BACKSPACE deletes, SELECT exits. Any key after an answer starts a new message; the conversation is remembered until you leave the app.<br>
+  <b>Terminal:</b> type, ENTER runs. UP/DOWN browse command history, or flip pages when an answer is longer than the screen. FN1 clears the line, FN2/BACKSPACE deletes, SELECT exits. Type <code>help</code> for the list and <code>help ls</code> for a command's usage. Files: ls cd pwd cat mkdir touch rm cp mv write append edit wc head tail find grep tree df run. Others: echo time date ver about sys uptime whoami history rand roll flip add sub mul div mod pow upper reverse len clear exit off. Numbers are spelled as words (example: add five three).<br>
+  <b>Text edit:</b> type, ENTER = new line, FN1 saves, FN2/BACKSPACE deletes, UP/DOWN read the file page by page, SELECT saves and exits. A new document asks for a file name when you save (use / for folders).<br>
+  <b>Files:</b> UP/DOWN choose, SELECT or ENTER opens a folder or a file in the editor, <code>..</code> goes up, FN1 goes back (and exits at the top), FN2 makes a new file (type the name, ENTER). Pressing a letter jumps to the next name starting with it.<br>
+  <b>Clock:</b> FN1 toggles time/date, FN2 toggles 12/24-hour format. <b>Dice:</b> FN1 rolls, FN2 cycles dice type; UP/DOWN also change dice type.<br>
+  <b>Saved files:</b> stored on the computer running this script (see the path below), one filesystem per password.</small>
 </section>
 
 <details>
@@ -1856,6 +2603,7 @@ const PAGE = `<!doctype html>
     document.getElementById('promptst').textContent = '';
     document.getElementById('osscreen').textContent = '(AI mode)';
     document.getElementById('osst').textContent = '';
+    document.getElementById('osfs').textContent = '';
     clearStatusLines();
     var box = document.getElementById('passst');
     box.textContent = 'not connected';
@@ -2035,6 +2783,7 @@ const PAGE = `<!doctype html>
       var pinTxt = [];
       for (var q = 0; q < names.length; q++) pinTxt.push(names[q] + '=' + (s.input ? s.input.charAt(q) : '?'));
       document.getElementById('ospins').textContent = 'pins from game: ' + pinTxt.join(' ') + ' (a key only fires when its pin goes 0 to 1)';
+      document.getElementById('osfs').textContent = 'saved files: ' + s.fs.nodes + ' item(s), ' + s.fs.chars + ' characters in ' + s.fs.file;
       var scr = document.getElementById('osscreen');
       if (s.mode !== 'os') scr.textContent = '(AI mode)';
       else if (!s.os.power) scr.textContent = '(power off)';
@@ -2093,7 +2842,7 @@ app.use((req, res) => {
     error: 'Endpoint not found: ' + req.method + ' ' + req.path,
     displayEndpoint: 'GET or POST /out',
     keyboardBanks: 'POST (or GET) /keys/1 through /keys/4',
-    individualKeys: 'POST (or GET) /key/a through /key/z and /key/enter'
+    individualKeys: 'POST (or GET) /key/a through /key/z, /key/enter, /key/space, /key/backspace'
   });
 });
 
@@ -2102,14 +2851,15 @@ app.listen(PORT, () => {
   console.log('Panel page: http://localhost:' + PORT + '/');
   console.log('Default display transmitter: /out (GET or POST; the only endpoint that returns display frames).');
   console.log('Auxiliary keyboard transmitters: /keys/1 through /keys/4 (POST recommended; GET also accepted; no display output).');
-  console.log('Individual-key aliases: /key/a ... /key/z and /key/enter (also /keys/a ... /keys/z and /keys/enter).');
+  console.log('Individual-key aliases: /key/a ... /key/z, /key/enter, /key/space, /key/backspace, /key/dot, /key/dash, /key/slash.');
   console.log('Hardware count: 1 display + 4 keyboard = 5 total.');
   console.log('  Set this header on your HTTP Transmitter:  ' + PASS_HEADER + ': <your-password>');
   console.log('  Headers dictionary:  ' + dictionary);
   console.log('  Use the SAME pass value on the display transmitter and all four keyboard transmitters.');
-  console.log('  Different pass values still create separate panels.');
+  console.log('  Different pass values still create separate panels (each with its own saved files).');
   console.log('  The page itself is open. Type the same password into it to control that panel.');
   console.log('  Simulated OS: switch a panel to OS mode in section 5 of the page.');
+  console.log('  Saved files live in: ' + DATA_FILE);
   console.log(groqKey ? 'Groq key loaded from GROQ_API_KEY (shared by all transmitters).' : 'No Groq key yet - set one on the page (AI mode + ai chat only; the rest of the OS does not need it).');
   console.log(INITIAL_PROMPT !== null ? 'New transmitters start with the PANEL_PROMPT prompt.' : 'New transmitters start with the default prompt (change it per panel on the page).');
 });

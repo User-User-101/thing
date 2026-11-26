@@ -830,7 +830,7 @@ function fsRoot(t) {
   return root;
 }
 
-const validName = (n) => /^[a-z0-9][a-z0-9._-]{0,23}$/.test(String(n));
+const validName = (n) => /^[a-z0-9_][a-z0-9._-]{0,23}$/.test(String(n));
 
 function childOf(dir, name) {
   return Object.prototype.hasOwnProperty.call(dir.children, name) ? dir.children[name] : null;
@@ -1036,6 +1036,7 @@ const APPS = [
   { id: 'files', name: 'files' },
   { id: 'clok', name: 'clock' },
   { id: 'dice', name: 'dice' },
+  { id: 'games', name: 'games' },
 ];
 
 // The four 8-pin POST keyboard banks. Array position 0 is physical pin 1.
@@ -1065,6 +1066,7 @@ const DICE_SIDES = [4, 6, 8, 10, 12, 20, 100];
 const newTerm = () => ({ buf: '', out: null, page: 0, cwd: '/', hist: [], histIdx: -1 });
 const newEditor = () => ({ path: null, text: '', dirty: false, saveAs: null, scroll: null, returnTo: 'menu', notice: '' });
 const newFiles = () => ({ cwd: '/', cursor: 0, newName: null, notice: '' });
+const newGames = () => ({ screen: 'menu', cursor: 0, g: null });
 const newAi = () => ({ shown: false, text: '', draft: '', notice: '' });
 
 function makeOS() {
@@ -1082,6 +1084,7 @@ function makeOS() {
     clock: { showDate: false, use24h: true },
     dice: { side: 1, result: null },
     ai: newAi(),
+    games: newGames(),
   };
 }
 
@@ -1231,6 +1234,9 @@ function osRows(t) {
 
     case 'dice':
       return ['d' + DICE_SIDES[os.dice.side] + (os.dice.result === null ? '' : ': ' + os.dice.result)];
+
+    case 'games':
+      return gamesRows(t);
 
     case 'ai': {
       const ai = os.ai;
@@ -1607,8 +1613,8 @@ function termKey(t, key) {
     tm.buf = '';
     tm.page = 0;
   }
-  if (key === 'fn1') tm.buf = '';
-  else if (key === 'fn2') tm.buf = tm.buf.slice(0, -1);
+  // FN1 does nothing while typing (it used to clear the line), so a stray press loses nothing.
+  if (key === 'fn2') tm.buf = tm.buf.slice(0, -1);
   else if (key === 'up' || key === 'down') termHistory(tm, key);
 }
 
@@ -1659,13 +1665,13 @@ function editorKey(t, key) {
   const ed = t.os.editor;
   if (ed.saveAs !== null) {                           // typing a file name
     if (key === 'select') ed.saveAs = null;
-    else if (key === 'fn1') ed.saveAs = '';
     else if (key === 'fn2') ed.saveAs = ed.saveAs.slice(0, -1);
     return;
   }
   ed.notice = '';
   if (key === 'fn1') {
-    editorSave(t);
+    if (ed.path) editorSave(t);                      // unnamed: FN1 never opens the name prompt
+    else ed.notice = 'unsaved: select=save';
   } else if (key === 'fn2') {
     ed.scroll = null;
     if (ed.text.length) { ed.text = ed.text.slice(0, -1); ed.dirty = true; }
@@ -1708,9 +1714,10 @@ function fmOpen(t) {
 // ENTER while the new file name is being typed.
 function fmCreate(t) {
   const fm = t.os.files;
-  const name = fm.newName.trim();
+  const name = fm.newName.trim().toLowerCase();
   fm.newName = null;
-  if (!validName(name)) { fm.notice = 'bad name'; return; }
+  const parts = name.split('/').filter(Boolean);
+  if (!parts.length || !parts.every(validName)) { fm.notice = 'bad name'; return; }
   const err = openEditor(t, pathStr(splitPath(fm.cwd, name)), 'files');   // saved on first save
   if (err) fm.notice = 'open failed: ' + err;
 }
@@ -1720,7 +1727,6 @@ function filesKey(t, key) {
   const fm = os.files;
   if (fm.newName !== null) {                          // typing a new file name
     if (key === 'select') fm.newName = null;
-    else if (key === 'fn1') fm.newName = '';
     else if (key === 'fn2') fm.newName = fm.newName.slice(0, -1);
     return;
   }
@@ -1729,7 +1735,11 @@ function filesKey(t, key) {
   if (key === 'down') fm.cursor = list.length ? (fm.cursor + 1) % list.length : 0;
   else if (key === 'up') fm.cursor = list.length ? (fm.cursor - 1 + list.length) % list.length : 0;
   else if (key === 'select') fmOpen(t);
-  else if (key === 'fn1') { if (fm.cwd === '/') os.app = 'menu'; else fmGoUp(fm); }
+  else if (key === 'fn1') {
+    if (fm.cwd !== '/') fmGoUp(fm);
+    else if (fm.exitArm && Date.now() - fm.exitArm < 2000) { fm.exitArm = 0; os.app = 'menu'; }
+    else { fm.exitArm = Date.now(); fm.notice = 'fn1 again=exit'; }   // needs two presses to leave
+  }
   else if (key === 'fn2') fm.newName = '';
 }
 
@@ -1741,8 +1751,141 @@ function aiKey(t, key) {
   if (t.chatBusy) return;
   if (ai.shown) { ai.shown = false; ai.text = ''; ai.draft = ''; }
   ai.notice = '';
-  if (key === 'fn1') ai.draft = '';
-  else if (key === 'fn2') ai.draft = ai.draft.slice(0, -1);
+  if (key === 'fn2') ai.draft = ai.draft.slice(0, -1);
+}
+
+// ---- games (all played with the keyboard letters) ----
+
+const HANG_WORDS = ['panel', 'signal', 'switch', 'button', 'screen', 'letter', 'cursor', 'wiring',
+  'circuit', 'battery', 'tunnel', 'server', 'pixel', 'binary', 'planet', 'rocket', 'castle',
+  'dragon', 'forest', 'garden', 'island', 'jungle', 'magnet', 'marble', 'puzzle', 'shadow',
+  'spider', 'thunder', 'turtle', 'window', 'yellow', 'zipper', 'anchor', 'bridge', 'candle'];
+const pick = (list) => list[Math.floor(Math.random() * list.length)];
+const CARD_NAMES = ['', 'ace', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'jack', 'queen', 'king'];
+const TTT_KEYS = 'qweasdzxc';
+const TTT_LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+const tttWinner = (b) => {
+  for (const [a, c, d] of TTT_LINES) if (b[a] !== '.' && b[a] === b[c] && b[a] === b[d]) return b[a];
+  return b.includes('.') ? null : 'draw';
+};
+function tttCpu(b) {
+  const free = [];
+  b.forEach((v, i) => { if (v === '.') free.push(i); });
+  for (const who of ['O', 'X']) {                       // win first, then block
+    for (const i of free) {
+      const c = b.slice(); c[i] = who;
+      if (tttWinner(c) === who) return i;
+    }
+  }
+  if (free.includes(4)) return 4;
+  return pick(free);
+}
+
+const GAME_LIST = [
+  { id: 'hang', name: 'hangman',
+    init: () => ({ word: pick(HANG_WORDS), guessed: '', lives: 6, over: false }),
+    key(g, ch) {
+      if (g.over) return Object.assign(g, this.init());
+      if (!/^[a-z]$/.test(ch) || g.guessed.includes(ch)) return;
+      g.guessed += ch;
+      if (!g.word.includes(ch)) g.lives--;
+      if (g.lives <= 0 || [...g.word].every((c) => g.guessed.includes(c))) g.over = true;
+    },
+    rows(g) {
+      const won = [...g.word].every((c) => g.guessed.includes(c));
+      if (g.over) return won ? [g.word, 'you win! any key'] : ['it was ' + g.word, 'you lose any key'];
+      const mask = [...g.word].map((c) => (g.guessed.includes(c) ? c : '_')).join(' ');
+      const wrong = [...g.guessed].filter((c) => !g.word.includes(c)).join('');
+      return [fit(mask), fit('lives ' + g.lives + ' ' + wrong)];
+    } },
+  { id: 'rps', name: 'rock paper',
+    init: () => ({ w: 0, l: 0, d: 0, last: '' }),
+    key(g, ch) {
+      const names = { r: 'rok', p: 'pap', s: 'sci' };
+      if (!names[ch]) return;
+      const cpu = pick(['r', 'p', 's']);
+      const beats = { r: 's', p: 'r', s: 'p' };
+      let res = 'tie';
+      if (ch !== cpu) res = beats[ch] === cpu ? 'win' : 'lose';
+      if (res === 'win') g.w++; else if (res === 'lose') g.l++; else g.d++;
+      g.last = names[ch] + ' v ' + names[cpu] + ' ' + res;
+    },
+    rows(g) { return ['r p or s?', fit(g.last), fit('w' + g.w + ' l' + g.l + ' d' + g.d)]; } },
+  { id: 'cards', name: 'high low',
+    init: () => ({ cur: 1 + Math.floor(Math.random() * 13), streak: 0, best: 0, msg: '' }),
+    key(g, ch) {
+      if (ch !== 'h' && ch !== 'l') return;
+      const next = 1 + Math.floor(Math.random() * 13);
+      if (next === g.cur) g.msg = 'same card, push';
+      else if ((ch === 'h') === (next > g.cur)) { g.streak++; g.best = Math.max(g.best, g.streak); g.msg = 'right!'; }
+      else { g.streak = 0; g.msg = 'wrong!'; }
+      g.cur = next;
+    },
+    rows(g) {
+      const r = ['card: ' + CARD_NAMES[g.cur], 'h higher l lower', fit('run ' + g.streak + ' best ' + g.best)];
+      if (g.msg) r.push(fit(g.msg));
+      return r;
+    } },
+  { id: 'ttt', name: 'tic tac toe',
+    init: () => ({ b: Array(9).fill('.'), msg: '', over: false }),
+    key(g, ch) {
+      if (g.over) return Object.assign(g, this.init());
+      const i = TTT_KEYS.indexOf(ch);
+      if (i < 0 || g.b[i] !== '.') return;
+      g.b[i] = 'X';
+      let w = tttWinner(g.b);
+      if (!w) { g.b[tttCpu(g.b)] = 'O'; w = tttWinner(g.b); }
+      if (w) { g.over = true; g.msg = w === 'X' ? 'you win! any key' : w === 'O' ? 'cpu wins any key' : 'draw! any key'; }
+    },
+    rows(g) {
+      const b = g.b;
+      return [b.slice(0, 3).join('|'), b.slice(3, 6).join('|'), b.slice(6).join('|'), g.msg || 'keys qwe/asd/zxc'];
+    } },
+];
+
+function gamesRows(t) {
+  const gm = t.os.games || (t.os.games = newGames());
+  if (gm.screen === 'menu') {
+    gm.cursor = Math.min(Math.max(gm.cursor, 0), GAME_LIST.length - 1);
+    return layoutRows('▶ ' + GAME_LIST[gm.cursor].name + ' ' + (gm.cursor + 1) + '/' + GAME_LIST.length);
+  }
+  const def = GAME_LIST.find((x) => x.id === gm.screen);
+  return def.rows(gm.g);
+}
+
+function gamesStart(gm, def) { gm.screen = def.id; gm.g = def.init(); }
+
+// Game controls. Inside a game UP/DOWN/FN1/FN2 do nothing, so a stray press can never
+// wreck a game; SELECT goes back.
+function gamesKey(t, key) {
+  const os = t.os;
+  const gm = os.games || (os.games = newGames());
+  if (key === 'select') {
+    if (gm.screen === 'menu') os.app = 'menu';
+    else { gm.screen = 'menu'; gm.g = null; }
+    return;
+  }
+  if (gm.screen !== 'menu') return;
+  if (key === 'down' || key === 'fn2') gm.cursor = (gm.cursor + 1) % GAME_LIST.length;
+  else if (key === 'up' || key === 'fn1') gm.cursor = (gm.cursor - 1 + GAME_LIST.length) % GAME_LIST.length;
+}
+
+function gamesEnter(t) {
+  const gm = t.os.games || (t.os.games = newGames());
+  if (gm.screen === 'menu') gamesStart(gm, GAME_LIST[gm.cursor]);
+  else gm.g = GAME_LIST.find((x) => x.id === gm.screen).init();   // ENTER restarts
+}
+
+function gameChar(t, ch) {
+  const gm = t.os.games || (t.os.games = newGames());
+  if (gm.screen === 'menu') {                         // a letter jumps to a game: h r c t
+    for (let i = 1; i <= GAME_LIST.length; i++) {
+      const idx = (gm.cursor + i) % GAME_LIST.length;
+      if (GAME_LIST[idx].name.startsWith(ch)) { gm.cursor = idx; break; }
+    }
+    return;
+  }
+  GAME_LIST.find((x) => x.id === gm.screen).key(gm.g, ch);
 }
 
 // ---- menu and other apps ----
@@ -1757,6 +1900,7 @@ function menuKey(t, key) {
     if (os.app === 'edit') os.editor = newEditor();
     if (os.app === 'files') { os.files.newName = null; os.files.notice = ''; }
     if (os.app === 'dice') os.dice.result = rollDie(os);
+    if (os.app === 'games') os.games = newGames();
     if (os.app === 'ai') {
       os.ai = newAi();
       clearHistory(t);
@@ -1771,6 +1915,7 @@ function appKey(t, key) {
     case 'term': termKey(t, key); break;
     case 'edit': editorKey(t, key); break;
     case 'files': filesKey(t, key); break;
+    case 'games': gamesKey(t, key); break;
     case 'clok':
       if (key === 'select') os.app = 'menu';
       else if (key === 'fn1') os.clock.showDate = !os.clock.showDate;
@@ -1854,7 +1999,7 @@ function textInput(t, ch) {
   if (os.app === 'edit') {
     const ed = os.editor;
     if (ed.saveAs !== null) {
-      if (ch !== ' ' && ed.saveAs.length < 40) ed.saveAs += ch;
+      if (/^[a-z0-9._\/ -]$/.test(ch) && ed.saveAs.length < 40) ed.saveAs += (ch === ' ' ? '-' : ch);
       return true;
     }
     ed.notice = '';
@@ -1870,10 +2015,19 @@ function textInput(t, ch) {
     if (ai.draft.length < AI_DRAFT_MAX) ai.draft += ch;
     return true;
   }
+  if (os.app === 'games') { gameChar(t, ch); return true; }
+  if (os.app === 'menu') {                            // a letter jumps to the next app starting with it
+    for (let i = 1; i <= APPS.length; i++) {
+      const idx = (os.cursor + i) % APPS.length;
+      if (APPS[idx].name.startsWith(ch)) { os.cursor = idx; break; }
+    }
+    return true;
+  }
+  if (os.app === 'clok' || os.app === 'dice') return true;   // letters are accepted, they just do nothing
   if (os.app === 'files') {
     const fm = os.files;
     if (fm.newName !== null) {
-      if (/^[a-z0-9._-]$/.test(ch) && fm.newName.length < 24) fm.newName += ch;
+      if (/^[a-z0-9._\/ -]$/.test(ch) && fm.newName.length < 40) fm.newName += (ch === ' ' ? '-' : ch);
       return true;
     }
     fm.notice = '';
@@ -1937,6 +2091,12 @@ function keyboardEnter(t) {
     menuKey(t, 'select');
     redrawOS(t);
     noteAction(t, 'keyboard ENTER opened ' + os.app);
+    return true;
+  }
+  if (os.app === 'games') {
+    gamesEnter(t);
+    redrawOS(t);
+    noteAction(t, 'keyboard ENTER (games)');
     return true;
   }
   if (os.app === 'clok' || os.app === 'dice') {
@@ -2094,11 +2254,11 @@ function handleKeyboardEndpoint(req, res, routeName) {
     }
     t.keyBankPrev.set(bank.id, bits);
 
-    if (rising.length > 1) {
-      noteAction(t, 'keyboard bank ' + bank.id + ' ignored simultaneous keys: ' + rising.join('+'));
-    } else if (rising.length === 1) {
-      dispatchKeyboardKey(t, rising[0]);
-      t.keyBankLastFire.set(bank.id + ':' + rising[0], Date.now());
+    if (rising.length >= 1) {
+      for (const k of rising) {                       // every new key is typed, in pin order
+        dispatchKeyboardKey(t, k);
+        t.keyBankLastFire.set(bank.id + ':' + k, Date.now());
+      }
     } else {
       // Enter-only repeat fallback: handles transmitters that never POST the all-zero
       // release state. Normal zero->one presses still work immediately.
@@ -2510,6 +2670,8 @@ const PAGE = `<!doctype html>
   <b>Terminal:</b> type, ENTER runs. UP/DOWN browse command history, or flip pages when an answer is longer than the screen. FN1 clears the line, FN2/BACKSPACE deletes, SELECT exits. Type <code>help</code> for the list and <code>help ls</code> for a command's usage. Files: ls cd pwd cat mkdir touch rm cp mv write append edit wc head tail find grep tree df run. Others: echo time date ver about sys uptime whoami history rand roll flip add sub mul div mod pow upper reverse len clear exit off. Numbers are spelled as words (example: add five three).<br>
   <b>Text edit:</b> type, ENTER = new line, FN1 saves, FN2/BACKSPACE deletes, UP/DOWN read the file page by page, SELECT saves and exits. A new document asks for a file name when you save (use / for folders).<br>
   <b>Files:</b> UP/DOWN choose, SELECT or ENTER opens a folder or a file in the editor, <code>..</code> goes up, FN1 goes back (and exits at the top), FN2 makes a new file (type the name, ENTER). Pressing a letter jumps to the next name starting with it.<br>
+  <b>Games:</b> hangman (type letters), rock paper (r/p/s), high low (h/l), tic tac toe (keys q w e / a s d / z x c). Letters jump to a game, ENTER starts or restarts, SELECT goes back. FN1/FN2 never disturb a running game.<br>
+  <b>Typing safety:</b> FN1 no longer clears or exits while you type. Names accept every letter, space becomes -, and / makes folders. In Files, FN1 needs two presses at the top level to exit.<br>
   <b>Clock:</b> FN1 toggles time/date, FN2 toggles 12/24-hour format. <b>Dice:</b> FN1 rolls, FN2 cycles dice type; UP/DOWN also change dice type.<br>
   <b>Saved files:</b> stored on the computer running this script (see the path below), one filesystem per password.</small>
 </section>

@@ -1048,7 +1048,10 @@ const KEY_BANKS = [
   { id: '4', keys: ['y', 'z', 'enter', 'space', 'backspace', 'dot', 'dash', 'slash'] },
 ];
 const KEY_CHARS = { space: ' ', dot: '.', dash: '-', slash: '/' };
-const WEB_KEYBOARD_KEYS = new Set(['enter', 'space', 'backspace']);
+const WEB_KEYBOARD_KEYS = new Set([
+  'enter', 'space', 'backspace', 'dot', 'dash', 'slash',
+  ...'abcdefghijklmnopqrstuvwxyz'.split(''),
+]);
 // Some transmitter setups keep POSTing the pressed state and do not send a zero on release.
 // Enter gets a slow repeat fallback so it can be pressed again after opening an app.
 const ENTER_REPEAT_MS = 700;
@@ -2608,6 +2611,9 @@ const PAGE = `<!doctype html>
   summary { cursor:pointer; font-weight:600; }
   pre.screen { background:#000; color:#7f7; font-family:monospace; font-size:1.2rem; line-height:1.3; letter-spacing:.15em; white-space:pre; padding:.6rem .8rem; border-radius:8px; margin:.4rem .2rem; min-height:3.6rem; overflow-x:auto; }
   .keys button { min-width:5.2rem; }
+  .typebox { margin:.6rem 0; }
+  .typebox input { width:100%; box-sizing:border-box; }
+  #osletters button { min-width:2.1rem; padding:.35rem .4rem; }
 </style>
 <h1>Panel Text</h1>
 
@@ -2671,6 +2677,13 @@ const PAGE = `<!doctype html>
     <button onclick="osKey('enter')">Keyboard Enter</button>
     <button onclick="osKey('space')">Keyboard Space</button>
     <button onclick="osKey('backspace')">Backspace</button>
+  </div>
+  <div class="typebox">
+    <b>Type into the OS from your keyboard</b><br>
+    <input id="webtype" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+           placeholder="Click here, then type (letters, space, . - /, Enter, Backspace)">
+    <small>Whatever you press here goes to the OS exactly like the keyboard pins do. Pasting text types it in too. Works in the terminal, text editor, file names and AI chat.</small>
+    <div class="keys" id="osletters"></div>
   </div>
   <div class="st" id="osst"></div>
   <div class="st" id="ospins"></div>
@@ -2920,6 +2933,94 @@ const PAGE = `<!doctype html>
     }
     refresh();
   }
+
+  // ---- Typing into the OS from the web page ----
+  // Keys are sent one at a time, in order, so fast typing or pasting never gets shuffled.
+  var typeQueue = [];
+  var typeBusy = false;
+
+  function webKeyName(ch) {
+    if (ch === ' ') return 'space';
+    if (ch === '.') return 'dot';
+    if (ch === '-') return 'dash';
+    if (ch === '/') return 'slash';
+    ch = ch.toLowerCase();
+    if (ch.length === 1 && ch >= 'a' && ch <= 'z') return ch;
+    return null;
+  }
+
+  function queueKey(name) {
+    if (!name) return;
+    typeQueue.push(name);
+    if (!typeBusy) drainKeys();
+  }
+
+  async function drainKeys() {
+    typeBusy = true;
+    var box = document.getElementById('osst');
+    while (typeQueue.length) {
+      var k = typeQueue.shift();
+      try {
+        var r = await fetch('/api/os/key', { method: 'POST', headers: passHeaders(), body: JSON.stringify({ key: k }) });
+        if (!r.ok) {
+          var j = {};
+          try { j = await r.json(); } catch (e) {}
+          box.textContent = j.error || 'error ' + r.status;
+          box.className = 'st bad';
+          typeQueue = [];
+          break;
+        }
+        box.textContent = 'typed ' + k;
+        box.className = 'st ok';
+      } catch (e) {
+        box.textContent = 'error: ' + e.message;
+        box.className = 'st bad';
+        typeQueue = [];
+        break;
+      }
+    }
+    typeBusy = false;
+    refresh();
+  }
+
+  (function setupWebTyping() {
+    var inp = document.getElementById('webtype');
+    inp.addEventListener('keydown', function (e) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;      // leave paste/copy shortcuts alone
+      var name = null;
+      if (e.key === 'Enter') name = 'enter';
+      else if (e.key === 'Backspace') name = 'backspace';
+      else if (e.key.length === 1) name = webKeyName(e.key);
+      else return;                                          // Tab, arrows etc. behave normally
+      e.preventDefault();
+      if (e.repeat && name === 'enter') return;
+      queueKey(name);
+    });
+    inp.addEventListener('paste', function (e) {
+      e.preventDefault();
+      var text = (e.clipboardData || window.clipboardData).getData('text') || '';
+      for (var i = 0; i < text.length; i++) {
+        var c = text.charAt(i);
+        if (c === String.fromCharCode(10) || c === String.fromCharCode(13)) { continue; }
+        queueKey(webKeyName(c));
+      }
+    });
+    // Phones: soft keyboards often send input events without useful keydown data.
+    inp.addEventListener('input', function () {
+      var v = inp.value;
+      inp.value = '';
+      for (var i = 0; i < v.length; i++) queueKey(webKeyName(v.charAt(i)));
+    });
+
+    var holder = document.getElementById('osletters');
+    var labels = 'abcdefghijklmnopqrstuvwxyz./-'.split('');
+    labels.forEach(function (ch) {
+      var b = document.createElement('button');
+      b.textContent = ch;
+      b.onclick = function () { queueKey(webKeyName(ch)); };
+      holder.appendChild(b);
+    });
+  })();
 
   // ---- AI prompt ----
   async function loadPrompt() {
